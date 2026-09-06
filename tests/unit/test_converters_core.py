@@ -7070,6 +7070,40 @@ class TestFillerOnlyWhereKiroNeedsIt:
         assert current["content"] == ""
         assert current["userInputMessageContext"]["toolResults"]
 
+    def test_tag_injection_path_keeps_the_filler(self):
+        """
+        What it does: With fake reasoning injecting tags, a textless tool-result turn
+                      still gets the filler.
+        Goal: On that path the turn's own text is where the thinking instructions go.
+              A turn made of nothing but instructions is not a request, and probing it
+              that way returned an answer with no content at all. History turns are
+              unaffected, and they are where the repetition came from.
+        """
+        messages = [
+            UnifiedMessage(role="user", content="List the files"),
+            UnifiedMessage(role="assistant", content="",
+                           tool_calls=[{"id": "t1", "name": "shell", "input": {"cmd": "ls"}}]),
+            UnifiedMessage(role="user", content="",
+                           tool_results=[{"tool_use_id": "t1", "content": "a.txt", "is_error": False}]),
+        ]
+        tools = [UnifiedTool(name="shell", description="Run a command",
+                             input_schema={"type": "object", "properties": {}})]
+
+        with patch("kiro.converters_core.FAKE_REASONING_ENABLED", True):
+            result = build_kiro_payload(
+                messages=messages,
+                system_prompt="",
+                model_id="claude-sonnet-4.5",  # takes no native fields, so tags are used
+                tools=tools,
+                conversation_id="conv-tags",
+                profile_arn="arn:aws:test",
+                thinking_config=ThinkingConfig(enabled=True, budget_tokens=4000),
+            )
+
+        content = result.payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+        print(f"current content: {content[:120]!r}")
+        assert EMPTY_TURN_PLACEHOLDER in content, f"filler missing: {content[:200]!r}"
+
     def test_current_message_carrying_nothing_gets_filler(self):
         """
         What it does: A current turn with nothing at all gets filler.

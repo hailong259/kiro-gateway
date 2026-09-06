@@ -1905,9 +1905,24 @@ def build_kiro_payload(
         if tool_results:
             user_input_context["toolResults"] = tool_results
     
-    # Only a message carrying nothing at all needs text invented for it: Kiro accepts
-    # empty content next to toolResults and rejects it on its own.
-    if not current_content and not user_input_context.get("toolResults"):
+    # Tag injection puts the thinking instructions into this turn's own text, and a
+    # turn consisting of nothing but instructions is not a request: probed once on
+    # that path with empty content, claude-opus-5 answered nothing at all. So the
+    # filler stays wherever it is the only thing standing between the model and a
+    # turn with no request in it. History turns are unaffected, and they are where
+    # the repetition came from.
+    tag_injection_applies = (
+        current_message.role == "user"
+        and not use_native_reasoning
+        and FAKE_REASONING_ENABLED
+        and thinking_config.enabled
+    )
+
+    # Otherwise only a message carrying nothing at all needs text invented for it:
+    # Kiro accepts empty content next to toolResults and rejects it on its own.
+    if not current_content and (
+        not user_input_context.get("toolResults") or tag_injection_applies
+    ):
         current_content = EMPTY_TURN_PLACEHOLDER
 
     # Inject thinking tags if enabled (only for fake reasoning when native reasoning is NOT used)
