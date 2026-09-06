@@ -24,7 +24,7 @@ This module is an adapter layer that converts Anthropic-specific formats
 to the unified format used by converters_core.py.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from loguru import logger
 
@@ -433,6 +433,65 @@ def extract_thinking_display(request: AnthropicMessagesRequest) -> Optional[str]
     return str(display).strip().lower()
 
 
+# Context edit descriptions already reported, so a long-lived process says each thing
+# once instead of on every request.
+_REPORTED_CONTEXT_EDITS: Set[str] = set()
+
+
+def unsupported_context_edits(context_management: Any) -> List[str]:
+    """
+    Name the context_management edits that would change the conversation.
+
+    Kiro has no server-side context editing, so nothing in context_management is
+    applied. That only matters for edits asking for something to be removed or
+    summarised: a client believing its clearing strategy is active will size its
+    history on a false assumption.
+
+    An edit asking for nothing to be dropped is not such a case.
+    clear_thinking with keep="all" preserves every thinking block, which is also
+    what current Claude models do by default, so ignoring it changes nothing.
+    Claude Code CLI sends exactly that on every turn, and reporting it produced a
+    warning per request that no operator could act on.
+
+    Args:
+        context_management: The request's context_management value
+
+    Returns:
+        Edit type names worth reporting, empty when there is nothing to report
+
+    Examples:
+        >>> unsupported_context_edits({"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]})
+        []
+        >>> unsupported_context_edits({"edits": [{"type": "clear_tool_uses_20250919"}]})
+        ['clear_tool_uses_20250919']
+        >>> unsupported_context_edits(None)
+        []
+    """
+    if not isinstance(context_management, dict):
+        return []
+
+    edits = context_management.get("edits")
+    if not isinstance(edits, list):
+        return []
+
+    reportable = []
+    for edit in edits:
+        if not isinstance(edit, dict):
+            continue
+
+        edit_type = str(edit.get("type") or "").strip()
+        if not edit_type:
+            continue
+
+        # keep="all" asks for no thinking to be dropped, so there is nothing to apply.
+        if edit_type.startswith("clear_thinking") and edit.get("keep") == "all":
+            continue
+
+        reportable.append(edit_type)
+
+    return reportable
+
+
 def extract_native_thinking_type(request: AnthropicMessagesRequest) -> Optional[str]:
     """
     Map Anthropic's thinking.type onto the value Kiro's schema accepts.
@@ -661,13 +720,21 @@ def anthropic_to_kiro(
     thinking_config = extract_thinking_config_from_anthropic(request)
     
     # Kiro has no server-side context editing, so context_management cannot be applied.
-    # Say so rather than accepting it silently: a client that believes its clearing or
-    # compaction strategy is active will size its history on a false assumption.
-    if request.context_management:
-        logger.warning(
-            "Request sets context_management, which Kiro does not support. "
-            "The field is ignored and no context editing is applied."
-        )
+    # Report the edits that would have changed the conversation rather than the mere
+    # presence of the field, and report each set once: an edit that asks for nothing to
+    # be dropped costs the client nothing, and warning per request buries the log.
+    reportable_edits = unsupported_context_edits(request.context_management)
+    if reportable_edits:
+        edit_names = ", ".join(sorted(set(reportable_edits)))
+        if edit_names in _REPORTED_CONTEXT_EDITS:
+            logger.debug(f"context_management edits still ignored: {edit_names}")
+        else:
+            _REPORTED_CONTEXT_EDITS.add(edit_names)
+            logger.warning(
+                f"Request sets context_management edits Kiro does not support: {edit_names}. "
+                f"They are ignored and no context editing is applied. "
+                f"This is logged once per process."
+            )
 
     logger.debug(
         f"Converting Anthropic request: model={request.model} -> {model_id}, "

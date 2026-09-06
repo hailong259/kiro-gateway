@@ -2475,10 +2475,12 @@ class TestExtractThinkingDisplay:
 
 class TestContextManagementIsNotSilentlyIgnored:
     """
-    Tests that an unsupported context_management request is reported.
+    Tests which context_management requests are reported and which are not.
 
     Kiro offers no server-side context editing, so the field cannot be honored.
-    Accepting it without a word lets a client believe its context strategy is active.
+    Accepting a clearing strategy without a word lets a client believe it is active.
+    An edit that asks for nothing to be dropped is not such a case, and Claude Code
+    CLI sends one on every turn, so reporting it warned once per request forever.
     """
 
     def _convert(self, context_management):
@@ -2503,18 +2505,69 @@ class TestContextManagementIsNotSilentlyIgnored:
 
     def test_context_management_request_is_reported(self):
         """
-        What it does: A context_management request produces a warning naming the field.
+        What it does: An edit that would drop history produces a warning naming it.
         Goal: Silent acceptance misleads the client about what the gateway applied.
         """
-        captured = self._convert({"edits": [{"type": "clear_thinking_20251015"}]})
+        from kiro import converters_anthropic as ca
+        ca._REPORTED_CONTEXT_EDITS.clear()
+        captured = self._convert({"edits": [{"type": "clear_tool_uses_20250919"}]})
         print(f"warnings: {captured}")
-        assert any("context_management" in line for line in captured), f"no warning: {captured}"
+        assert any("clear_tool_uses_20250919" in line for line in captured), f"no warning: {captured}"
+
+    def test_repeat_of_the_same_edit_is_not_warned_again(self):
+        """
+        What it does: The same edit set warns once per process, not per request.
+        Goal: A client sending it every turn otherwise fills the log with a line no
+              operator can act on.
+        """
+        from kiro import converters_anthropic as ca
+        ca._REPORTED_CONTEXT_EDITS.clear()
+        edits = {"edits": [{"type": "clear_tool_uses_20250919"}]}
+        first = self._convert(edits)
+        second = self._convert(edits)
+        print(f"first={first}")
+        print(f"second={second}")
+        assert any("clear_tool_uses_20250919" in line for line in first), f"no warning: {first}"
+        assert not any("clear_tool_uses_20250919" in line for line in second), f"repeated: {second}"
+
+    def test_keep_all_thinking_is_not_reported(self):
+        """
+        What it does: clear_thinking with keep="all" produces no warning.
+        Goal: It asks for every thinking block to be preserved, which is what happens
+              anyway, so there is nothing for the client to be misled about. Claude
+              Code CLI sends this on every turn.
+        """
+        from kiro import converters_anthropic as ca
+        ca._REPORTED_CONTEXT_EDITS.clear()
+        captured = self._convert(
+            {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]}
+        )
+        print(f"warnings: {captured}")
+        assert not any("context_management" in line for line in captured), f"unexpected: {captured}"
+
+    def test_keep_limited_thinking_is_reported(self):
+        """
+        What it does: clear_thinking keeping only recent turns is reported.
+        Goal: That edit does ask for thinking to be dropped, and Kiro will not do it.
+        """
+        from kiro import converters_anthropic as ca
+        ca._REPORTED_CONTEXT_EDITS.clear()
+        captured = self._convert({
+            "edits": [{
+                "type": "clear_thinking_20251015",
+                "keep": {"type": "thinking_turns", "value": 3},
+            }]
+        })
+        print(f"warnings: {captured}")
+        assert any("clear_thinking_20251015" in line for line in captured), f"no warning: {captured}"
 
     def test_no_warning_when_context_management_absent(self):
         """
         What it does: A request without the field logs no such warning.
         Goal: Guard against warning on every request.
         """
+        from kiro import converters_anthropic as ca
+        ca._REPORTED_CONTEXT_EDITS.clear()
         captured = self._convert(None)
         print(f"warnings: {captured}")
         assert not any("context_management" in line for line in captured), f"unexpected: {captured}"
