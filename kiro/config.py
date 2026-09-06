@@ -184,6 +184,13 @@ KIRO_API_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
 # Host for Q API (ListAvailableModels)
 KIRO_Q_HOST_TEMPLATE: str = "https://runtime.{region}.kiro.dev"
 
+# Host serving model metadata (ListAvailableModels). The runtime chat host answers that
+# operation with 404 UnknownOperationException, while this one answers it for the same
+# credentials, and only its response carries each model's
+# additionalModelRequestFieldsSchema - the schema deciding which
+# additionalModelRequestFields a model accepts.
+KIRO_METADATA_HOST_TEMPLATE: str = "https://q.{region}.amazonaws.com"
+
 # ==================================================================================================
 # Token Settings
 # ==================================================================================================
@@ -278,10 +285,16 @@ FALLBACK_MODELS: List[Dict[str, str]] = [
     {"modelId": "claude-sonnet-4"},
     {"modelId": "claude-sonnet-4.5"},
     {"modelId": "claude-sonnet-4.6"},
+    {"modelId": "claude-sonnet-5"},
     {"modelId": "claude-haiku-4.5"},
     {"modelId": "claude-opus-4.5"},
     {"modelId": "claude-opus-4.6"},
     {"modelId": "claude-opus-4.7"},
+    {"modelId": "claude-opus-4.8"},
+    {"modelId": "claude-opus-5"},
+    {"modelId": "gpt-5.6-sol"},
+    {"modelId": "gpt-5.6-terra"},
+    {"modelId": "gpt-5.6-luna"},
     {"modelId": "deepseek-3.2"},
     {"modelId": "glm-5"},
     {"modelId": "minimax-m2.1"},
@@ -615,4 +628,15 @@ def get_kiro_api_host(region: str) -> str:
 def get_kiro_q_host(region: str) -> str:
     """Return Q API host for the specified region."""
     return KIRO_Q_HOST_TEMPLATE.format(region=region)
+
+
+def get_kiro_metadata_host(region: str) -> str:
+    """
+    Return the host serving ListAvailableModels for the specified region.
+
+    Examples:
+        >>> get_kiro_metadata_host("us-east-1")
+        'https://q.us-east-1.amazonaws.com'
+    """
+    return KIRO_METADATA_HOST_TEMPLATE.format(region=region)
 

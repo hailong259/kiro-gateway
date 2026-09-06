@@ -6471,9 +6471,9 @@ class TestNormalizeNativeEffort:
         assert normalize_native_effort("medium") == "medium"
         assert normalize_native_effort("high") == "high"
         assert normalize_native_effort("max") == "max"
-        # Aliases
+        # Aliases. xhigh is not one: Kiro has a real xhigh level on the opus-5 generation
         assert normalize_native_effort("minimal") == "low"
-        assert normalize_native_effort("xhigh") == "max"
+        assert normalize_native_effort("xhigh") == "xhigh"
         # Case insensitive
         assert normalize_native_effort("LOW") == "low"
         assert normalize_native_effort("Medium") == "medium"
@@ -6668,7 +6668,7 @@ class TestNormalizeNativeEffortRejectsUnknownValues:
         assert normalize_native_effort("medium") == "medium"
         assert normalize_native_effort("high") == "high"
         assert normalize_native_effort("max") == "max"
-        assert normalize_native_effort("xhigh") == "max"
+        assert normalize_native_effort("xhigh") == "xhigh"
         assert normalize_native_effort("MEDIUM") == "medium"
 
     def test_unknown_effort_budget_falls_back_without_raising(self):

@@ -37,6 +37,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -47,6 +48,7 @@ from loguru import logger
 
 from kiro.auth import KiroAuthManager, AuthType
 from kiro.cache import ModelInfoCache
+from kiro.model_capabilities import update_from_models as update_model_capabilities
 from kiro.model_resolver import ModelResolver, normalize_model_name
 from kiro.config import (
     HIDDEN_MODELS,
@@ -58,6 +60,7 @@ from kiro.config import (
     ACCOUNT_CACHE_TTL,
     STATE_SAVE_INTERVAL_SECONDS,
     FALLBACK_MODELS,
+    get_kiro_metadata_host,
 )
 from kiro.utils import get_kiro_headers
 from kiro.account_errors import ErrorType
@@ -71,11 +74,13 @@ def _is_runtime_endpoint(auth_manager: KiroAuthManager) -> bool:
     Runtime endpoint pattern: https://runtime.{region}.kiro.dev
     Old endpoint pattern: https://q.{region}.amazonaws.com
     
-    Runtime endpoint does not provide /ListAvailableModels API (AWS limitation).
-    
+    Runtime endpoint answers /ListAvailableModels with 404
+    UnknownOperationException, so model metadata is read from the CodeWhisperer
+    host instead - see :func:`_metadata_host`.
+
     Args:
         auth_manager: KiroAuthManager instance
-    
+
     Returns:
         True if using runtime endpoint, False otherwise
     
@@ -91,6 +96,38 @@ def _is_runtime_endpoint(auth_manager: KiroAuthManager) -> bool:
         False
     """
     return "://runtime." in auth_manager.api_host
+
+
+def _metadata_host(auth_manager: KiroAuthManager) -> str:
+    """
+    Return the host to ask for the model list.
+
+    Chat and metadata do not have to share a host. The runtime host serves chat but
+    not /ListAvailableModels, while q.{region}.amazonaws.com serves that operation
+    for the same credentials, and its response is the only place carrying each
+    model's additionalModelRequestFieldsSchema. Without it the gateway has to guess
+    which additionalModelRequestFields a model accepts, which is what Kiro CLI
+    never does.
+
+    Args:
+        auth_manager: KiroAuthManager instance
+
+    Returns:
+        Host to send /ListAvailableModels to
+
+    Examples:
+        >>> auth_manager.api_host = "https://runtime.us-east-1.kiro.dev"
+        >>> _metadata_host(auth_manager)
+        'https://q.us-east-1.amazonaws.com'
+    """
+    if not _is_runtime_endpoint(auth_manager):
+        return auth_manager.q_host
+
+    match = re.search(r"://runtime\.([a-z0-9-]+)\.kiro\.dev", auth_manager.api_host or "")
+    if not match:
+        return auth_manager.q_host
+
+    return get_kiro_metadata_host(match.group(1))
 
 
 def _format_duration(seconds: float) -> str:
@@ -497,49 +534,44 @@ class AccountManager:
             # Get token to verify credentials
             token = await auth_manager.get_access_token()
             
-            # Determine if we should fetch models or use static list
-            if _is_runtime_endpoint(auth_manager):
-                # New runtime endpoint does not provide /ListAvailableModels (AWS limitation)
-                # Use static list without attempting request
-                logger.debug(f"Account {account_id}: Using static model list for runtime.kiro.dev endpoint")
+            # Fetch the model list with retry + fallback
+            params = {"origin": "AI_EDITOR"}
+            if auth_manager.auth_type == AuthType.KIRO_DESKTOP and auth_manager.profile_arn:
+                params["profileArn"] = auth_manager.profile_arn
+
+            list_models_url = f"{_metadata_host(auth_manager)}/ListAvailableModels"
+
+            # Use KiroHttpClient for retry logic (3 attempts with exponential backoff)
+            http_client = KiroHttpClient(auth_manager, shared_client=None)
+
+            try:
+                response = await http_client.request_with_retry(
+                    method="GET",
+                    url=list_models_url,
+                    json_data=None,
+                    params=params,
+                    stream=False
+                )
+
+                if response.status_code == 200:
+                    data = response.json()
+                    models_list = data.get("models", [])
+                else:
+                    # Shouldn't happen (retry handles non-200), but keep for safety
+                    raise Exception(f"HTTP {response.status_code}")
+
+            except Exception as e:
+                # All retries exhausted - use fallback
+                logger.error(f"Failed to fetch models for {account_id} after retries: {e}")
+                logger.warning("Using pre-configured fallback models. Models will be refreshed on next TTL cycle when network recovers.")
                 models_list = FALLBACK_MODELS
-            else:
-                # Old endpoint - attempt to fetch dynamic model list
-                # Fetch models list with retry + fallback
-                params = {"origin": "AI_EDITOR"}
-                if auth_manager.auth_type == AuthType.KIRO_DESKTOP and auth_manager.profile_arn:
-                    params["profileArn"] = auth_manager.profile_arn
-                
-                list_models_url = f"{auth_manager.q_host}/ListAvailableModels"
-                
-                # Use KiroHttpClient for retry logic (3 attempts with exponential backoff)
-                http_client = KiroHttpClient(auth_manager, shared_client=None)
-                
-                try:
-                    response = await http_client.request_with_retry(
-                        method="GET",
-                        url=list_models_url,
-                        json_data=None,
-                        params=params,
-                        stream=False
-                    )
-                    
-                    if response.status_code == 200:
-                        data = response.json()
-                        models_list = data.get("models", [])
-                    else:
-                        # Shouldn't happen (retry handles non-200), but keep for safety
-                        raise Exception(f"HTTP {response.status_code}")
-                
-                except Exception as e:
-                    # All retries exhausted - use fallback
-                    logger.error(f"Failed to fetch models for {account_id} after retries: {e}")
-                    logger.warning("Using pre-configured fallback models. Models will be refreshed on next TTL cycle when network recovers.")
-                    models_list = FALLBACK_MODELS
-                
-                finally:
-                    await http_client.close()
-            
+
+            finally:
+                await http_client.close()
+
+            # Learn which additionalModelRequestFields each model accepts
+            update_model_capabilities(models_list)
+
             # Create model cache and update
             model_cache = ModelInfoCache()
             await model_cache.update(models_list)
@@ -589,17 +621,7 @@ class AccountManager:
         if not account or not account.auth_manager:
             return
         
-        # Check if using runtime endpoint (no dynamic model list available)
-        if _is_runtime_endpoint(account.auth_manager):
-            # Runtime endpoint does not provide /ListAvailableModels
-            # Use static list and update cache timestamp
-            logger.debug(f"Account {account_id}: Skipping model refresh for runtime.kiro.dev endpoint (using static list)")
-            await account.model_cache.update(FALLBACK_MODELS)
-            account.models_cached_at = time.time()
-            self._dirty = True
-            return
-        
-        # Old endpoint - attempt to fetch dynamic model list
+        # Attempt to fetch the dynamic model list
         # Use KiroHttpClient for retry logic
         http_client = KiroHttpClient(account.auth_manager, shared_client=None)
         
@@ -608,7 +630,7 @@ class AccountManager:
             if account.auth_manager.auth_type == AuthType.KIRO_DESKTOP and account.auth_manager.profile_arn:
                 params["profileArn"] = account.auth_manager.profile_arn
             
-            list_models_url = f"{account.auth_manager.q_host}/ListAvailableModels"
+            list_models_url = f"{_metadata_host(account.auth_manager)}/ListAvailableModels"
             
             response = await http_client.request_with_retry(
                 method="GET",
@@ -621,6 +643,7 @@ class AccountManager:
             if response.status_code == 200:
                 data = response.json()
                 models_list = data.get("models", [])
+                update_model_capabilities(models_list)
                 await account.model_cache.update(models_list)
                 account.models_cached_at = time.time()
                 

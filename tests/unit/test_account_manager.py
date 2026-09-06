@@ -19,6 +19,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 from kiro.account_manager import (
+    _metadata_host,
     Account,
     AccountStats,
     ModelAccountList,
@@ -1300,3 +1301,61 @@ class TestFormatDuration:
         """Test formatting days."""
         assert _format_duration(86400) == "1d"
         assert _format_duration(172800) == "2d"
+
+
+class TestMetadataHost:
+    """
+    Tests which host the model list is fetched from.
+
+    Chat and metadata do not share a host. runtime.{region}.kiro.dev answers
+    /ListAvailableModels with 404 UnknownOperationException, while
+    q.{region}.amazonaws.com answers it for the same credentials and is the only
+    source of each model's additionalModelRequestFieldsSchema, which says what
+    additionalModelRequestFields the model accepts.
+    """
+
+    def _auth(self, api_host):
+        auth_manager = MagicMock()
+        auth_manager.api_host = api_host
+        auth_manager.q_host = api_host
+        return auth_manager
+
+    def test_runtime_host_redirects_to_the_codewhisperer_host(self):
+        """
+        What it does: A runtime chat host reads metadata from q.{region}.
+        Goal: The runtime host serves no model list, so the gateway had none at all
+              and hardcoded what each model accepts.
+        """
+        host = _metadata_host(self._auth("https://runtime.us-east-1.kiro.dev"))
+        print(f"metadata host: {host}")
+        assert host == "https://q.us-east-1.amazonaws.com"
+
+    def test_region_is_carried_across(self):
+        """
+        What it does: The region in the chat host is reused for metadata.
+        Goal: Metadata must come from the same region as the credentials.
+        """
+        host = _metadata_host(self._auth("https://runtime.eu-central-1.kiro.dev"))
+        print(f"metadata host: {host}")
+        assert host == "https://q.eu-central-1.amazonaws.com"
+
+    def test_non_runtime_host_is_left_alone(self):
+        """
+        What it does: A CodeWhisperer chat host is used for metadata as-is.
+        Goal: It already serves the operation.
+        """
+        host = _metadata_host(self._auth("https://q.us-east-1.amazonaws.com"))
+        print(f"metadata host: {host}")
+        assert host == "https://q.us-east-1.amazonaws.com"
+
+    def test_unparseable_runtime_host_falls_back_to_q_host(self):
+        """
+        What it does: A runtime host with no region falls back rather than guessing.
+        Goal: A malformed host must not produce a bogus metadata URL.
+        """
+        auth_manager = MagicMock()
+        auth_manager.api_host = "https://runtime./kiro.dev"
+        auth_manager.q_host = "https://runtime./kiro.dev"
+        host = _metadata_host(auth_manager)
+        print(f"metadata host: {host}")
+        assert host == "https://runtime./kiro.dev"

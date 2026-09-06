@@ -2115,7 +2115,11 @@ class TestAnthropicToKiroIntegration:
         
         # Native reasoning creates additionalModelRequestFields
         assert "additionalModelRequestFields" in payload
-        assert payload["additionalModelRequestFields"] == {"output_config": {"effort": "medium"}}
+        fields = payload["additionalModelRequestFields"]
+        assert fields["output_config"] == {"effort": "medium"}, f"got {fields}"
+        # thinking.type=enabled maps onto Kiro's adaptive, and max_tokens rides along
+        assert fields["thinking"] == {"type": "adaptive"}, f"got {fields}"
+        assert fields["max_tokens"] == 1024, f"got {fields}"
         user_input = payload["conversationState"]["currentMessage"]["userInputMessage"]
         assert "Test message" in user_input["content"]
         assert "<thinking_mode>" not in user_input["content"]
@@ -2161,7 +2165,8 @@ class TestAnthropicToKiroIntegration:
             payload = anthropic_to_kiro(request, "test-conv-claude-code", "arn:aws:test")
         
         assert "additionalModelRequestFields" in payload
-        assert payload["additionalModelRequestFields"] == {"output_config": {"effort": "max"}}
+        fields = payload["additionalModelRequestFields"]
+        assert fields["output_config"] == {"effort": "max"}, f"got {fields}"
         user_input = payload["conversationState"]["currentMessage"]["userInputMessage"]
         assert "Tell me a joke" in user_input["content"]
         assert "<thinking_mode>" not in user_input["content"]
@@ -2183,7 +2188,8 @@ class TestAnthropicToKiroIntegration:
             payload = anthropic_to_kiro(request, "test-conv-claude-code-low", "arn:aws:test")
         
         assert "additionalModelRequestFields" in payload
-        assert payload["additionalModelRequestFields"] == {"output_config": {"effort": "low"}}
+        fields = payload["additionalModelRequestFields"]
+        assert fields["output_config"] == {"effort": "low"}, f"got {fields}"
         user_input = payload["conversationState"]["currentMessage"]["userInputMessage"]
         assert "Quick summary" in user_input["content"]
         assert "<thinking_mode>" not in user_input["content"]
@@ -2212,20 +2218,27 @@ class TestAnthropicNativeReasoningSchema:
         """
         fields = self._payload("claude-opus-4.7").get("additionalModelRequestFields")
         print(f"additionalModelRequestFields: {fields}")
-        assert fields == {"output_config": {"effort": "high"}}, f"got {fields}"
+        assert fields["output_config"] == {"effort": "high"}, f"got {fields}"
 
     def test_non_claude_model_uses_reasoning_schema(self):
         """
         What it does: A non-Claude Kiro model takes the reasoning schema here too.
         Goal: The Anthropic endpoint can address any Kiro model, not only Claude.
-
-        No non-Claude Kiro model currently accepts additionalModelRequestFields at
-        all, so the denylist is cleared here to keep the schema branch covered.
         """
-        with patch("kiro.converters_core.NATIVE_REASONING_UNSUPPORTED_MODELS", []):
-            fields = self._payload("deepseek-3.2").get("additionalModelRequestFields")
+        fields = self._payload("gpt-5.6-sol").get("additionalModelRequestFields")
         print(f"additionalModelRequestFields: {fields}")
-        assert fields == {"reasoning": {"effort": "high"}}, f"got {fields}"
+        assert fields["reasoning"] == {"effort": "high"}, f"got {fields}"
+
+    def test_non_claude_model_gets_no_thinking_property(self):
+        """
+        What it does: The reasoning-schema models are sent no thinking property.
+        Goal: Their schema forbids it, and Kiro answers 400 "property 'thinking' is
+              not defined in the schema" for the whole request.
+        """
+        fields = self._payload("gpt-5.6-sol").get("additionalModelRequestFields")
+        print(f"additionalModelRequestFields: {fields}")
+        assert "thinking" not in fields, f"thinking must not be sent: {fields}"
+        assert "max_tokens" not in fields, f"max_tokens must not be sent: {fields}"
 
 
 class TestUnknownEffortNeverReachesKiro:
@@ -2269,7 +2282,7 @@ class TestUnknownEffortNeverReachesKiro:
 
         fields = payload.get("additionalModelRequestFields")
         print(f"additionalModelRequestFields: {fields}")
-        assert fields == {"output_config": {"effort": "medium"}}, f"got {fields}"
+        assert fields["output_config"] == {"effort": "medium"}, f"got {fields}"
 
 
 class TestMultipleThinkingBlocksInOneMessage:
@@ -2333,12 +2346,16 @@ class TestMultipleThinkingBlocksInOneMessage:
 
 class TestAdaptiveThinkingMatchesOmittedThinking:
     """
-    Tests that adaptive thinking without an explicit effort behaves like omitting
-    the thinking parameter.
+    Tests that adaptive thinking without an explicit effort picks no effort of its
+    own, the way omitting the thinking parameter does not.
 
-    On current Claude models, omitting thinking is equivalent to adaptive, so the two
-    must not land on different reasoning paths. Adaptive used to hardcode a high
-    effort and switch to native reasoning while the omitted case did not.
+    On current Claude models, omitting thinking is equivalent to adaptive, so neither
+    may invent a reasoning level. Adaptive used to hardcode a high effort and switch
+    to native reasoning while the omitted case did not.
+
+    The two are not identical: naming adaptive explicitly does forward
+    thinking.type=adaptive, which omitting it cannot, since there is nothing to
+    forward. Effort is what has to agree.
     """
 
     def _config(self, thinking, default_effort):
@@ -2354,7 +2371,8 @@ class TestAdaptiveThinkingMatchesOmittedThinking:
 
     def test_adaptive_without_effort_matches_omitted_thinking(self):
         """
-        What it does: With no operator default, adaptive and omitted agree.
+        What it does: With no operator default, adaptive and omitted pick the same
+                      effort, namely none at all.
         Goal: The two paths described the same client intent but diverged.
         """
         adaptive = self._config({"type": "adaptive"}, None)
@@ -2362,7 +2380,23 @@ class TestAdaptiveThinkingMatchesOmittedThinking:
 
         print(f"adaptive={adaptive}")
         print(f"omitted ={omitted}")
-        assert adaptive == omitted
+        assert adaptive.native_effort == omitted.native_effort
+        assert adaptive.native_effort is None
+        assert adaptive.enabled == omitted.enabled
+        assert adaptive.budget_tokens == omitted.budget_tokens
+
+    def test_adaptive_forwards_the_type_the_client_named(self):
+        """
+        What it does: Adaptive thinking forwards thinking.type=adaptive.
+        Goal: The client named a Kiro-supported value, so it travels instead of
+              being emulated with prompt tags.
+        """
+        adaptive = self._config({"type": "adaptive"}, None)
+        omitted = self._config(None, None)
+
+        print(f"adaptive.native_thinking_type={adaptive.native_thinking_type}")
+        assert adaptive.native_thinking_type == "adaptive"
+        assert omitted.native_thinking_type is None
 
     def test_adaptive_follows_operator_default_effort(self):
         """

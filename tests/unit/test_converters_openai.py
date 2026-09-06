@@ -1985,13 +1985,9 @@ class TestNativeReasoningSchemaFromResolvedModel:
     def test_non_claude_model_uses_reasoning_schema(self):
         """
         What it does: A non-Claude Kiro model takes the reasoning schema.
-        Goal: Kiro serves deepseek and qwen models that do not take output_config.
-
-        No non-Claude Kiro model currently accepts additionalModelRequestFields at
-        all, so the denylist is cleared here to keep the schema branch covered.
+        Goal: Kiro serves models that do not take output_config.
         """
-        with patch("kiro.converters_core.NATIVE_REASONING_UNSUPPORTED_MODELS", []):
-            payload = self._payload("deepseek-3.2")
+        payload = self._payload("gpt-5.6-sol")
         fields = payload.get("additionalModelRequestFields")
         print(f"additionalModelRequestFields: {fields}")
         assert fields == {"reasoning": {"effort": "high"}}, f"got {fields}"

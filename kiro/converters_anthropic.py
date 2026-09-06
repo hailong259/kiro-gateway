@@ -433,6 +433,47 @@ def extract_thinking_display(request: AnthropicMessagesRequest) -> Optional[str]
     return str(display).strip().lower()
 
 
+def extract_native_thinking_type(request: AnthropicMessagesRequest) -> Optional[str]:
+    """
+    Map Anthropic's thinking.type onto the value Kiro's schema accepts.
+
+    Kiro's enum is ("adaptive", "disabled"). Anthropic's "enabled" predates
+    "adaptive" and means the same thing on current models, so it maps to
+    adaptive; anything else is left to Kiro's own default.
+
+    Forwarding this matters most for "disabled": with no thinking property in the
+    request, Kiro reasons by default, so a client asking for no thinking still
+    pays for it.
+
+    Args:
+        request: Anthropic MessagesRequest
+
+    Returns:
+        "adaptive", "disabled", or None when the request said nothing usable
+
+    Examples:
+        >>> request.thinking = {"type": "disabled"}
+        >>> extract_native_thinking_type(request)
+        'disabled'
+        >>> request.thinking = {"type": "enabled", "budget_tokens": 4096}
+        >>> extract_native_thinking_type(request)
+        'adaptive'
+    """
+    if not isinstance(request.thinking, dict):
+        return None
+
+    thinking_type = request.thinking.get("type")
+    if not thinking_type:
+        return None
+
+    normalized = str(thinking_type).strip().lower()
+    if normalized == "disabled":
+        return "disabled"
+    if normalized in ("adaptive", "enabled"):
+        return "adaptive"
+    return None
+
+
 def extract_thinking_config_from_anthropic(request: AnthropicMessagesRequest) -> ThinkingConfig:
     """
     Extract thinking configuration from Anthropic request.
@@ -484,9 +525,18 @@ def extract_thinking_config_from_anthropic(request: AnthropicMessagesRequest) ->
         >>> extract_thinking_config_from_anthropic(request)
         ThinkingConfig(enabled=True, budget_tokens=60800)  # 95% of 64000
     """
+    # Values Kiro accepts natively next to effort. They are gathered before the
+    # disabled check below so every return carries them: build_kiro_payload only
+    # forwards the ones the resolved model declares.
+    native_extras = {
+        "native_thinking_type": extract_native_thinking_type(request),
+        "native_display": extract_thinking_display(request),
+        "native_max_tokens": request.max_tokens if isinstance(request.max_tokens, int) else None,
+    }
+
     # 1. Check if thinking is explicitly disabled via thinking parameter
     if isinstance(request.thinking, dict) and request.thinking.get("type") == "disabled":
-        return ThinkingConfig(enabled=False, budget_tokens=None)
+        return ThinkingConfig(enabled=False, budget_tokens=None, **native_extras)
     
     # 2. Extract effort from output_config, thinking, or request attributes
     effort = None
@@ -503,7 +553,7 @@ def extract_thinking_config_from_anthropic(request: AnthropicMessagesRequest) ->
     if effort is not None:
         effort_str = str(effort).strip().lower()
         if effort_str == "none":
-            return ThinkingConfig(enabled=False, budget_tokens=None)
+            return ThinkingConfig(enabled=False, budget_tokens=None, **native_extras)
     
     # 4. Check if explicit budget_tokens is provided in thinking parameter
     if isinstance(request.thinking, dict):
@@ -521,10 +571,11 @@ def extract_thinking_config_from_anthropic(request: AnthropicMessagesRequest) ->
                     return ThinkingConfig(
                         enabled=True,
                         budget_tokens=budget_int,
-                        native_effort=derived_effort
+                        native_effort=derived_effort,
+                        **native_extras
                     )
                 else:
-                    return ThinkingConfig(enabled=False, budget_tokens=None)
+                    return ThinkingConfig(enabled=False, budget_tokens=None, **native_extras)
             except (ValueError, TypeError):
                 pass
     
@@ -534,7 +585,7 @@ def extract_thinking_config_from_anthropic(request: AnthropicMessagesRequest) ->
         max_tokens = request.max_tokens or 4096
         budget = reasoning_effort_to_budget(max_tokens, effort_str)
         if budget <= 0:
-            return ThinkingConfig(enabled=False, budget_tokens=None)
+            return ThinkingConfig(enabled=False, budget_tokens=None, **native_extras)
         
         normalized_effort = normalize_native_effort(effort_str)
         logger.debug(
@@ -544,7 +595,8 @@ def extract_thinking_config_from_anthropic(request: AnthropicMessagesRequest) ->
         return ThinkingConfig(
             enabled=True,
             budget_tokens=budget,
-            native_effort=normalized_effort
+            native_effort=normalized_effort,
+            **native_extras
         )
     
     # 6. Adaptive thinking without an explicit effort is equivalent to omitting the
@@ -560,10 +612,11 @@ def extract_thinking_config_from_anthropic(request: AnthropicMessagesRequest) ->
             return ThinkingConfig(
                 enabled=True,
                 budget_tokens=budget,
-                native_effort=default_effort
+                native_effort=default_effort,
+                **native_extras
             )
 
-    return ThinkingConfig(enabled=True, budget_tokens=None)
+    return ThinkingConfig(enabled=True, budget_tokens=None, **native_extras)
 
 
 def anthropic_to_kiro(

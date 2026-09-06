@@ -47,6 +47,15 @@ from kiro.config import (
     AUTO_TRIM_PAYLOAD,
 )
 from kiro.payload_guards import check_payload_size, trim_payload_to_limit
+from kiro.model_capabilities import (
+    adapt_effort,
+    clamp_max_tokens,
+    effort_levels,
+    effort_schema_path,
+    get as get_model_capability,
+    supports_display,
+    supports_thinking_type,
+)
 
 
 # ==================================================================================================
@@ -64,22 +73,38 @@ class ThinkingConfig:
     Attributes:
         enabled: Whether thinking/reasoning is enabled
         budget_tokens: Token budget for thinking (None = use default)
-        native_effort: Effort level for native reasoning ("low", "medium", "high", "max")
-        schema_path: Schema path for native reasoning ("output_config" for Claude, "reasoning" for others)
-    
+        native_effort: Effort level for native reasoning ("low", "medium", "high",
+            "xhigh", "max"); the level is fitted to the model's enum when the
+            payload is built
+        schema_path: Override for the additionalModelRequestFields key holding
+            effort; None lets the model's capabilities decide
+        native_thinking_type: Anthropic thinking.type to forward ("adaptive" or
+            "disabled"), for models whose schema declares a thinking property
+        native_display: Anthropic thinking.display to forward ("summarized" or
+            "omitted")
+        native_max_tokens: Client max_tokens to forward, clamped to the model's
+            declared bounds
+
     Examples:
         >>> # Default configuration
-        >>> ThinkingConfig()
-        ThinkingConfig(enabled=True, budget_tokens=None, native_effort=None, schema_path='output_config')
-        
+        >>> ThinkingConfig().enabled
+        True
+
         >>> # Native reasoning with effort
-        >>> ThinkingConfig(enabled=True, native_effort="max", schema_path="output_config")
-        ThinkingConfig(enabled=True, budget_tokens=None, native_effort='max', schema_path='output_config')
+        >>> ThinkingConfig(enabled=True, native_effort="max").native_effort
+        'max'
+
+        >>> # Anthropic asked for no thinking at all
+        >>> ThinkingConfig(enabled=False, native_thinking_type="disabled").native_thinking_type
+        'disabled'
     """
     enabled: bool = True
     budget_tokens: Optional[int] = None
     native_effort: Optional[str] = None
     schema_path: Optional[str] = None
+    native_thinking_type: Optional[str] = None
+    native_display: Optional[str] = None
+    native_max_tokens: Optional[int] = None
 
 
 def native_reasoning_supported(model_id: str) -> bool:
@@ -91,17 +116,21 @@ def native_reasoning_supported(model_id: str) -> bool:
     depth. Those are listed in NATIVE_REASONING_UNSUPPORTED_MODELS and fall back to
     thinking tag injection instead.
     
+    The model's published capabilities answer this when they are known, which is
+    what Kiro CLI goes by: a model Kiro publishes an additionalModelRequestFields
+    schema for accepts the field, and one it publishes nothing for does not.
+
     An unrecognized model is allowed through, because the gateway is a pass-through:
     models are discovered at runtime and the list cannot be complete, so Kiro decides.
     Treating unknown models as unsupported instead demoted claude-opus-5 to the tag
     path even though Kiro accepts the field for it.
-    
+
     Args:
         model_id: Resolved Kiro model id
-    
+
     Returns:
         True when the field may be sent
-    
+
     Examples:
         >>> native_reasoning_supported("claude-opus-5")
         True
@@ -111,6 +140,11 @@ def native_reasoning_supported(model_id: str) -> bool:
     normalized = (model_id or "").strip().lower()
     if not normalized:
         return False
+
+    capability = get_model_capability(normalized)
+    if capability is not None:
+        return capability.accepts_additional_fields
+
     return normalized not in NATIVE_REASONING_UNSUPPORTED_MODELS
 
 
@@ -121,7 +155,10 @@ def native_reasoning_schema_path(model_id: str) -> str:
     Claude models take output_config.effort; other Kiro models take reasoning.effort.
     The auto router dispatches to Claude models, so it takes the Claude schema even
     though its id does not name Claude.
-    
+
+    The model's published schema decides this when it is known; the name-based rule
+    below only covers models the gateway has no metadata for.
+
     This must be given the resolved Kiro model id, never the model name the client
     sent: aliases such as "auto" or a user-defined "gpt-5" mapping carry no hint of
     the backing model.
@@ -141,6 +178,11 @@ def native_reasoning_schema_path(model_id: str) -> str:
         'reasoning'
     """
     normalized = (model_id or "").strip().lower()
+
+    published_path = effort_schema_path(normalized)
+    if published_path:
+        return published_path
+
     if normalized.startswith("claude") or normalized.startswith("auto"):
         return "output_config"
     return "reasoning"
@@ -168,16 +210,101 @@ def normalize_native_effort(effort: Any) -> Optional[str]:
         return "medium"
     if val == "high":
         return "high"
-    if val in ("max", "xhigh"):
-        # Kiro accepts four levels, so xhigh folds into max. Anthropic places xhigh
-        # between high and max, so this is the closest level Kiro can express.
+    if val == "xhigh":
+        # Kiro has a real xhigh level on the opus-5 generation, verified live. Models
+        # whose enum lacks it (the 4.6 generation) get the level fitted to their enum
+        # when the payload is built, so this stays canonical here.
+        return "xhigh"
+    if val == "max":
         return "max"
-    
+
     # Unknown level: do not forward it. Kiro rejects unrecognized effort values with a
     # validation error the client cannot act on, and the caller falls back to the
     # thinking-tag path when no native effort is available.
     logger.warning(f"Unsupported reasoning effort '{val}' ignored for native reasoning")
     return None
+
+
+def build_native_reasoning_fields(
+    model_id: str,
+    thinking_config: "ThinkingConfig",
+) -> Dict[str, Any]:
+    """
+    Assemble the additionalModelRequestFields object for one request.
+
+    Kiro validates the object against the model's published schema and answers
+    HTTP 400 for any property or value it does not declare, which fails the whole
+    request. So every part is gated on positive evidence that the model accepts
+    it, and a model with no known capabilities gets effort only, exactly as
+    before.
+
+    Three things are forwarded, mirroring what Kiro CLI sends:
+    - effort, fitted to the model's own enum
+    - thinking.type and thinking.display, for models declaring a thinking property
+    - max_tokens, clamped to the model's bounds
+
+    Thinking that the client switched off is forwarded too, as
+    thinking.type=disabled, or as effort=none on models whose enum has it.
+    Sending nothing instead leaves Kiro on its default, which reasons anyway:
+    claude-opus-5 emitted 47 reasoning events for a request that asked for none.
+
+    Args:
+        model_id: Resolved Kiro model id
+        thinking_config: Thinking configuration from the API adapter
+
+    Returns:
+        The object to send, or an empty dict when there is nothing to send
+
+    Examples:
+        >>> build_native_reasoning_fields("claude-opus-5", ThinkingConfig(native_effort="xhigh"))
+        {'output_config': {'effort': 'xhigh'}}
+        >>> build_native_reasoning_fields("claude-sonnet-4.6", ThinkingConfig(native_effort="xhigh"))
+        {'output_config': {'effort': 'max'}}
+        >>> build_native_reasoning_fields("claude-opus-5", ThinkingConfig(enabled=False, native_thinking_type="disabled"))
+        {'thinking': {'type': 'disabled'}}
+        >>> build_native_reasoning_fields("claude-sonnet-4.5", ThinkingConfig(native_effort="high"))
+        {}
+    """
+    if not NATIVE_REASONING_ENABLED:
+        return {}
+    if not native_reasoning_supported(model_id):
+        return {}
+
+    schema_path = thinking_config.schema_path or native_reasoning_schema_path(model_id)
+    fields: Dict[str, Any] = {}
+
+    if thinking_config.enabled:
+        effort = adapt_effort(model_id, thinking_config.native_effort)
+        if effort:
+            fields[schema_path] = {"effort": effort}
+
+        thinking_type = thinking_config.native_thinking_type
+        if thinking_type and not supports_thinking_type(model_id, thinking_type):
+            thinking_type = None
+
+        display = thinking_config.native_display
+        if display and not supports_display(model_id, display):
+            display = None
+
+        # The schema marks thinking.type required, so display cannot travel alone.
+        if display and not thinking_type and supports_thinking_type(model_id, "adaptive"):
+            thinking_type = "adaptive"
+
+        if thinking_type:
+            fields["thinking"] = {"type": thinking_type}
+            if display:
+                fields["thinking"]["display"] = display
+    elif supports_thinking_type(model_id, "disabled"):
+        fields["thinking"] = {"type": "disabled"}
+    elif "none" in effort_levels(model_id):
+        # Models without a thinking property express "no reasoning" as an effort.
+        fields[schema_path] = {"effort": "none"}
+
+    max_tokens = clamp_max_tokens(model_id, thinking_config.native_max_tokens)
+    if max_tokens is not None and fields:
+        fields["max_tokens"] = max_tokens
+
+    return fields
 
 
 def budget_to_effort(budget_tokens: int) -> str:
@@ -1646,23 +1773,17 @@ def build_kiro_payload(
     if tool_documentation:
         full_system_prompt = full_system_prompt + tool_documentation if full_system_prompt else tool_documentation.strip()
     
-    # Check if native reasoning should be used
-    use_native_reasoning = (
-        NATIVE_REASONING_ENABLED and
-        thinking_config.enabled and
-        bool(thinking_config.native_effort) and
-        thinking_config.native_effort.lower() != "none" and
-        native_reasoning_supported(model_id)
-    )
-    
+    # Build the native reasoning fields this model accepts (matches kiro-cli)
+    native_reasoning_fields = build_native_reasoning_fields(model_id, thinking_config)
+    use_native_reasoning = bool(native_reasoning_fields)
+
     if (NATIVE_REASONING_ENABLED and thinking_config.enabled
-            and thinking_config.native_effort and not use_native_reasoning
-            and not native_reasoning_supported(model_id)):
+            and thinking_config.native_effort and not use_native_reasoning):
         logger.debug(
             f"Model '{model_id}' does not accept additionalModelRequestFields; "
             f"falling back to thinking tag injection"
         )
-    
+
     # Add thinking mode legitimization to system prompt if enabled (only for fake reasoning)
     if not use_native_reasoning:
         thinking_system_addition = get_thinking_system_prompt_addition()
@@ -1797,16 +1918,11 @@ def build_kiro_payload(
         }
     }
     
-    # Add native reasoning fields if enabled (matches kiro-cli structure)
-    if use_native_reasoning:
-        schema_path = thinking_config.schema_path or native_reasoning_schema_path(model_id)
-        payload["additionalModelRequestFields"] = {
-            schema_path: {
-                "effort": thinking_config.native_effort
-            }
-        }
-        logger.debug(f"Applied native reasoning fields: {payload['additionalModelRequestFields']}")
-    
+    # Add native reasoning fields if the model accepts them (matches kiro-cli structure)
+    if native_reasoning_fields:
+        payload["additionalModelRequestFields"] = native_reasoning_fields
+        logger.debug(f"Applied native reasoning fields: {native_reasoning_fields}")
+
     # Add history only if not empty
     if history:
         payload["conversationState"]["history"] = history
