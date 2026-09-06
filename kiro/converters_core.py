@@ -58,6 +58,23 @@ from kiro.model_capabilities import (
 )
 
 
+# Filler for a turn that carries nothing at all. Kiro rejects a message with no
+# content and no tool payload with "Improperly formed request.", so something has to
+# go there.
+#
+# It is used as narrowly as possible. Filling every textless turn with it taught the
+# model to say it: in an agent conversation almost no turn has text - the assistant
+# only calls tools and the user only returns results - so a real 430-turn request
+# carried this string as the content of 117 of its 215 assistant turns and 199 of its
+# 215 user turns, making it by far the most frequent thing the model had ever "said".
+# The model then began emitting it as its own reply, which is what users saw.
+#
+# Measured against the live API: content="" is accepted for an assistant turn, and for
+# a user turn that carries toolResults, and rejected only for a message that carries
+# nothing else.
+EMPTY_TURN_PLACEHOLDER = "(empty placeholder)"
+
+
 # ==================================================================================================
 # Data Classes for Unified Message Format
 # ==================================================================================================
@@ -1262,7 +1279,7 @@ def strip_all_tool_content(messages: List[UnifiedMessage]) -> Tuple[List[Unified
                     content_parts.append(result_text)
             
             # Join all parts with double newline
-            content = "\n\n".join(content_parts) if content_parts else "(empty placeholder)"
+            content = "\n\n".join(content_parts) if content_parts else EMPTY_TURN_PLACEHOLDER
             
             # Create a copy of the message without tool content but with text representation
             # IMPORTANT: Preserve images from the original message (e.g., screenshots from MCP tools)
@@ -1498,11 +1515,12 @@ def ensure_first_message_is_user(messages: List[UnifiedMessage]) -> List[Unified
             f"First message is '{messages[0].role}', prepending synthetic user message "
             f"(Kiro API requires conversations to start with user)"
         )
-        # Create minimal synthetic user message (matches LiteLLM behavior)
-        # Using "(empty placeholder)" as minimal valid content to avoid disrupting conversation context
+        # Create minimal synthetic user message (matches LiteLLM behavior).
+        # This turn carries nothing else, so it needs text: Kiro rejects a user
+        # message with neither content nor toolResults.
         synthetic_user = UnifiedMessage(
             role="user",
-            content="(empty placeholder)"
+            content=EMPTY_TURN_PLACEHOLDER
         )
         
         return [synthetic_user] + messages
@@ -1583,7 +1601,7 @@ def ensure_alternating_roles(messages: List[UnifiedMessage]) -> List[UnifiedMess
     
     Kiro API requires alternating userInputMessage and assistantResponseMessage.
     When consecutive user messages are detected, synthetic assistant messages
-    with "(empty placeholder)" placeholder are inserted between them to maintain alternation.
+    with empty content are inserted between them to maintain alternation.
     
     This fixes multiple unknown roles (converted to user)
     create consecutive userInputMessage entries that violate Kiro API requirements.
@@ -1606,7 +1624,7 @@ def ensure_alternating_roles(messages: List[UnifiedMessage]) -> List[UnifiedMess
         >>> result[1].role
         'assistant'
         >>> result[1].content
-        '(empty placeholder)'
+        ''
     """
     if not messages or len(messages) < 2:
         return messages
@@ -1619,9 +1637,11 @@ def ensure_alternating_roles(messages: List[UnifiedMessage]) -> List[UnifiedMess
         
         # If both current and previous are user → insert synthetic assistant
         if msg.role == "user" and prev_role == "user":
+            # An assistant turn may be empty: it exists only to separate two user
+            # turns, and Kiro accepts an empty assistantResponseMessage.
             synthetic_assistant = UnifiedMessage(
                 role="assistant",
-                content="(empty placeholder)"  # Consistent with build_kiro_history() placeholder
+                content=""
             )
             result.append(synthetic_assistant)
             synthetic_count += 1
@@ -1660,29 +1680,10 @@ def build_kiro_history(messages: List[UnifiedMessage], model_id: str) -> List[Di
     for msg in messages:
         if msg.role == "user":
             content = extract_text_content(msg.content)
-            
-            # Fallback for empty content - Kiro API requires non-empty content
-            if not content:
-                content = "(empty placeholder)"
-            
-            user_input = {
-                "content": content,
-                "modelId": model_id,
-                "origin": "AI_EDITOR",
-            }
-            
-            # Process images - extract from message or content
-            # IMPORTANT: images go directly into userInputMessage, NOT into userInputMessageContext
-            # This matches the native Kiro IDE format
-            images = msg.images or extract_images_from_content(msg.content)
-            if images:
-                kiro_images = convert_images_to_kiro_format(images)
-                if kiro_images:
-                    user_input["images"] = kiro_images
-            
+
             # Build userInputMessageContext for tools and toolResults only
             user_input_context: Dict[str, Any] = {}
-            
+
             # Process tool_results - convert to Kiro format if present
             if msg.tool_results:
                 kiro_tool_results = convert_tool_results_to_kiro_format(msg.tool_results)
@@ -1693,20 +1694,39 @@ def build_kiro_history(messages: List[UnifiedMessage], model_id: str) -> List[Di
                 tool_results = extract_tool_results_from_content(msg.content)
                 if tool_results:
                     user_input_context["toolResults"] = tool_results
-            
+
+            # A turn returning tool results needs no text of its own, and inventing
+            # some is what taught the model to repeat the filler. Images are not
+            # counted here: whether they alone satisfy Kiro was not measured.
+            if not content and not user_input_context.get("toolResults"):
+                content = EMPTY_TURN_PLACEHOLDER
+
+            user_input = {
+                "content": content,
+                "modelId": model_id,
+                "origin": "AI_EDITOR",
+            }
+
+            # Process images - extract from message or content
+            # IMPORTANT: images go directly into userInputMessage, NOT into userInputMessageContext
+            # This matches the native Kiro IDE format
+            images = msg.images or extract_images_from_content(msg.content)
+            if images:
+                kiro_images = convert_images_to_kiro_format(images)
+                if kiro_images:
+                    user_input["images"] = kiro_images
+
             # Add context if not empty (contains toolResults only, not images)
             if user_input_context:
                 user_input["userInputMessageContext"] = user_input_context
-            
+
             history.append({"userInputMessage": user_input})
             
         elif msg.role == "assistant":
+            # An assistant turn that only called a tool has no text, and Kiro accepts
+            # an empty assistantResponseMessage, so nothing is invented here.
             content = extract_text_content(msg.content)
-            
-            # Fallback for empty content - Kiro API requires non-empty content
-            if not content:
-                content = "(empty placeholder)"
-            
+
             assistant_response = {"content": content}
             
             # Process tool_calls
@@ -1845,18 +1865,15 @@ def build_kiro_payload(
         current_content = f"{full_system_prompt}\n\n{current_content}"
     
     # If current message is assistant, need to add it to history
-    # and create user message placeholder
+    # and create user message placeholder. That invented turn carries nothing, so it
+    # needs text.
     if current_message.role == "assistant":
         history.append({
             "assistantResponseMessage": {
                 "content": current_content
             }
         })
-        current_content = "(empty placeholder)"
-    
-    # If content is empty - use placeholder
-    if not current_content:
-        current_content = "(empty placeholder)"
+        current_content = EMPTY_TURN_PLACEHOLDER
     
     # Process images in current message - extract from message or content
     # IMPORTANT: images go directly into userInputMessage, NOT into userInputMessageContext
@@ -1888,6 +1905,11 @@ def build_kiro_payload(
         if tool_results:
             user_input_context["toolResults"] = tool_results
     
+    # Only a message carrying nothing at all needs text invented for it: Kiro accepts
+    # empty content next to toolResults and rejects it on its own.
+    if not current_content and not user_input_context.get("toolResults"):
+        current_content = EMPTY_TURN_PLACEHOLDER
+
     # Inject thinking tags if enabled (only for fake reasoning when native reasoning is NOT used)
     if current_message.role == "user" and not use_native_reasoning:
         current_content = inject_thinking_tags(current_content, thinking_config)

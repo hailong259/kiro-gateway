@@ -11,11 +11,13 @@ Tests for shared conversion logic used by both OpenAI and Anthropic adapters:
 - Thinking tag injection
 """
 
+import json
 import os
 import pytest
 from unittest.mock import patch
 
 from kiro.converters_core import (
+    EMPTY_TURN_PLACEHOLDER,
     extract_text_content,
     extract_images_from_content,
     convert_images_to_kiro_format,
@@ -1715,7 +1717,9 @@ class TestEnsureAlternatingRoles:
         assert result[0].role == "user"
         assert result[0].content == "First"
         assert result[1].role == "assistant"
-        assert result[1].content == "(empty placeholder)"
+        # A separator turn carries no text: Kiro accepts an empty assistant message,
+        # and readable filler here taught the model to repeat the filler.
+        assert result[1].content == ""
         assert result[2].role == "user"
         assert result[2].content == "Second"
     
@@ -1739,11 +1743,11 @@ class TestEnsureAlternatingRoles:
         assert len(result) == 7
         print("Checking alternation pattern...")
         assert result[0].role == "user" and result[0].content == "First"
-        assert result[1].role == "assistant" and result[1].content == "(empty placeholder)"
+        assert result[1].role == "assistant" and result[1].content == ""
         assert result[2].role == "user" and result[2].content == "Second"
-        assert result[3].role == "assistant" and result[3].content == "(empty placeholder)"
+        assert result[3].role == "assistant" and result[3].content == ""
         assert result[4].role == "user" and result[4].content == "Third"
-        assert result[5].role == "assistant" and result[5].content == "(empty placeholder)"
+        assert result[5].role == "assistant" and result[5].content == ""
         assert result[6].role == "user" and result[6].content == "Fourth"
     
     def test_preserves_already_alternating_messages(self):
@@ -1792,15 +1796,15 @@ class TestEnsureAlternatingRoles:
         assert len(result) == 9
         print("Checking first group (A, synthetic, B)...")
         assert result[0].role == "user" and result[0].content == "A"
-        assert result[1].role == "assistant" and result[1].content == "(empty placeholder)"
+        assert result[1].role == "assistant" and result[1].content == ""
         assert result[2].role == "user" and result[2].content == "B"
         print("Checking real assistant...")
         assert result[3].role == "assistant" and result[3].content == "C"
         print("Checking second group (D, synthetic, E, synthetic, F)...")
         assert result[4].role == "user" and result[4].content == "D"
-        assert result[5].role == "assistant" and result[5].content == "(empty placeholder)"
+        assert result[5].role == "assistant" and result[5].content == ""
         assert result[6].role == "user" and result[6].content == "E"
-        assert result[7].role == "assistant" and result[7].content == "(empty placeholder)"
+        assert result[7].role == "assistant" and result[7].content == ""
         assert result[8].role == "user" and result[8].content == "F"
     
     def test_handles_empty_list(self):
@@ -1936,11 +1940,11 @@ class TestNormalizeAndAlternatingIntegration:
         assert len(result) == 7
         print("Checking alternation pattern...")
         assert result[0].role == "user" and result[0].content == "Context 1"
-        assert result[1].role == "assistant" and result[1].content == "(empty placeholder)"
+        assert result[1].role == "assistant" and result[1].content == ""
         assert result[2].role == "user" and result[2].content == "Context 2"
-        assert result[3].role == "assistant" and result[3].content == "(empty placeholder)"
+        assert result[3].role == "assistant" and result[3].content == ""
         assert result[4].role == "user" and result[4].content == "Context 3"
-        assert result[5].role == "assistant" and result[5].content == "(empty placeholder)"
+        assert result[5].role == "assistant" and result[5].content == ""
         assert result[6].role == "user" and result[6].content == "Question"
     
     def test_mixed_roles_are_normalized_and_alternated(self):
@@ -1975,13 +1979,13 @@ class TestNormalizeAndAlternatingIntegration:
         assert len(result) == 9
         print("Checking that all system/developer were converted to user...")
         assert result[0].role == "user" and result[0].content == "System"
-        assert result[1].role == "assistant" and result[1].content == "(empty placeholder)"
+        assert result[1].role == "assistant" and result[1].content == ""
         assert result[2].role == "user" and result[2].content == "Dev"
-        assert result[3].role == "assistant" and result[3].content == "(empty placeholder)"
+        assert result[3].role == "assistant" and result[3].content == ""
         assert result[4].role == "user" and result[4].content == "User1"
         assert result[5].role == "assistant" and result[5].content == "Assistant1"
         assert result[6].role == "user" and result[6].content == "Dev2"
-        assert result[7].role == "assistant" and result[7].content == "(empty placeholder)"
+        assert result[7].role == "assistant" and result[7].content == ""
         assert result[8].role == "user" and result[8].content == "User2"
 
 
@@ -3921,24 +3925,24 @@ class TestBuildKiroHistory:
         print("Checking that '(empty placeholder)' placeholder is added...")
         assert result[0]["userInputMessage"]["content"] == "(empty placeholder)"
     
-    def test_adds_empty_placeholder_for_empty_assistant_content(self):
+    def test_keeps_empty_assistant_content_empty(self):
         """
-        What it does: Verifies that "(empty placeholder)" placeholder is added for assistant messages with empty content.
-        Purpose: Ensure Kiro API receives non-empty content in history.
-        
-        This is a fallback test for issue #20 - ensures any edge case with empty content
-        is handled even if strip_all_tool_content didn't add a placeholder.
+        What it does: An assistant message with no text stays empty in history.
+        Purpose: Kiro accepts an empty assistantResponseMessage, measured live, so
+                 there is nothing to invent. Filling it with readable text is what
+                 taught the model to answer with that text: an agent conversation
+                 has almost no assistant text, so the filler became the most frequent
+                 thing the model had said and it started repeating it.
         """
         print("Setup: Assistant message with empty content...")
         messages = [UnifiedMessage(role="assistant", content="")]
-        
+
         print("Action: Building history...")
         result = build_kiro_history(messages, "claude-sonnet-4")
-        
+
         print(f"Result: {result}")
         print(f"Content: '{result[0]['assistantResponseMessage']['content']}'")
-        print("Checking that '(empty placeholder)' placeholder is added...")
-        assert result[0]["assistantResponseMessage"]["content"] == "(empty placeholder)"
+        assert result[0]["assistantResponseMessage"]["content"] == ""
     
     def test_adds_empty_placeholder_for_none_user_content(self):
         """
@@ -3956,10 +3960,10 @@ class TestBuildKiroHistory:
         print("Checking that '(empty placeholder)' placeholder is added...")
         assert result[0]["userInputMessage"]["content"] == "(empty placeholder)"
     
-    def test_adds_empty_placeholder_for_none_assistant_content(self):
+    def test_keeps_none_assistant_content_empty(self):
         """
-        What it does: Verifies that "(empty placeholder)" placeholder is added for assistant messages with None content.
-        Purpose: Ensure Kiro API receives non-empty content when content is None.
+        What it does: An assistant message with None content stays empty in history.
+        Purpose: Kiro accepts an empty assistantResponseMessage, so no filler is needed.
         """
         print("Setup: Assistant message with None content...")
         messages = [UnifiedMessage(role="assistant", content=None)]
@@ -3969,8 +3973,8 @@ class TestBuildKiroHistory:
         
         print(f"Result: {result}")
         print(f"Content: '{result[0]['assistantResponseMessage']['content']}'")
-        print("Checking that '(empty placeholder)' placeholder is added...")
-        assert result[0]["assistantResponseMessage"]["content"] == "(empty placeholder)"
+        print("Checking that no filler was invented...")
+        assert result[0]["assistantResponseMessage"]["content"] == ""
     
     def test_preserves_non_empty_content_in_history(self):
         """
@@ -4016,7 +4020,7 @@ class TestBuildKiroHistory:
         assert result[0]["userInputMessage"]["content"] == "Start"
         
         print(f"Message 1 content: '{result[1]['assistantResponseMessage']['content']}'")
-        assert result[1]["assistantResponseMessage"]["content"] == "(empty placeholder)"
+        assert result[1]["assistantResponseMessage"]["content"] == ""
         
         print(f"Message 2 content: '{result[2]['userInputMessage']['content']}'")
         assert result[2]["userInputMessage"]["content"] == "(empty placeholder)"
@@ -6944,3 +6948,147 @@ class TestNativeReasoningModelSupport:
         assert result.payload["additionalModelRequestFields"] == {"output_config": {"effort": "high"}}
         user_input = result.payload["conversationState"]["currentMessage"]["userInputMessage"]
         assert "<thinking_mode>" not in user_input["content"]
+
+
+class TestFillerOnlyWhereKiroNeedsIt:
+    """
+    Tests that readable filler goes only into turns Kiro would otherwise reject.
+
+    Kiro's rule, measured against the live API, is that a message must carry
+    something, not that its text must be non-empty:
+
+    - assistantResponseMessage with content="" is accepted
+    - userInputMessage with content="" and toolResults is accepted
+    - userInputMessage with content="" and nothing else answers 400
+      "Improperly formed request."
+
+    Filling every textless turn with "(empty placeholder)" taught the model to say
+    it. In an agent conversation almost no turn has text, so one real 430-turn
+    request carried the string as the content of 117 of its 215 assistant turns and
+    199 of its 215 user turns; it became the most frequent thing the model had ever
+    said, and it began emitting it as its own reply before each tool call.
+    """
+
+    def test_user_turn_with_tool_results_needs_no_text(self):
+        """
+        What it does: A tool-result turn keeps empty content.
+        Goal: It already carries toolResults, which Kiro accepts without text.
+        """
+        messages = [UnifiedMessage(
+            role="user",
+            content="",
+            tool_results=[{"tool_use_id": "t1", "content": "output", "is_error": False}],
+        )]
+        result = build_kiro_history(messages, "claude-sonnet-4")
+        print(f"result: {result}")
+        assert result[0]["userInputMessage"]["content"] == ""
+        assert result[0]["userInputMessage"]["userInputMessageContext"]["toolResults"]
+
+    def test_user_turn_carrying_nothing_still_gets_filler(self):
+        """
+        What it does: A user turn with neither text nor tool results gets filler.
+        Goal: Kiro answers 400 for such a message, so something has to go there.
+        """
+        messages = [UnifiedMessage(role="user", content="")]
+        result = build_kiro_history(messages, "claude-sonnet-4")
+        print(f"result: {result}")
+        assert result[0]["userInputMessage"]["content"] == EMPTY_TURN_PLACEHOLDER
+
+    def test_assistant_turn_with_tool_calls_needs_no_text(self):
+        """
+        What it does: A tool-calling assistant turn keeps empty content.
+        Goal: This is the shape of most assistant turns in an agent session.
+        """
+        messages = [UnifiedMessage(
+            role="assistant",
+            content="",
+            tool_calls=[{"id": "t1", "name": "shell", "input": {"cmd": "ls"}}],
+        )]
+        result = build_kiro_history(messages, "claude-sonnet-4")
+        print(f"result: {result}")
+        assert result[0]["assistantResponseMessage"]["content"] == ""
+
+    def test_tool_driven_conversation_carries_no_filler_at_all(self):
+        """
+        What it does: A full tool-calling exchange produces no filler anywhere.
+        Goal: This is the pattern the model was imitating; it has to be absent from
+              the payload the gateway builds, not merely rarer.
+        """
+        messages = [
+            UnifiedMessage(role="user", content="List the files"),
+            UnifiedMessage(role="assistant", content="",
+                           tool_calls=[{"id": "t1", "name": "shell", "input": {"cmd": "ls"}}]),
+            UnifiedMessage(role="user", content="",
+                           tool_results=[{"tool_use_id": "t1", "content": "a.txt", "is_error": False}]),
+            UnifiedMessage(role="assistant", content="",
+                           tool_calls=[{"id": "t2", "name": "shell", "input": {"cmd": "cat a.txt"}}]),
+            UnifiedMessage(role="user", content="",
+                           tool_results=[{"tool_use_id": "t2", "content": "hello", "is_error": False}]),
+        ]
+        tools = [UnifiedTool(name="shell", description="Run a command",
+                             input_schema={"type": "object", "properties": {}})]
+
+        result = build_kiro_payload(
+            messages=messages,
+            system_prompt="",
+            model_id="claude-sonnet-4",
+            tools=tools,
+            conversation_id="conv-filler",
+            profile_arn="arn:aws:test",
+            thinking_config=ThinkingConfig(enabled=False),
+        )
+        serialized = json.dumps(result.payload)
+        print(f"payload: {serialized[:400]}")
+        assert EMPTY_TURN_PLACEHOLDER not in serialized, "filler reached the payload"
+
+    def test_current_message_with_tool_results_needs_no_text(self):
+        """
+        What it does: A current turn returning tool results keeps empty content.
+        Goal: Verified live to be accepted, and it is the live Claude Code shape.
+        """
+        messages = [
+            UnifiedMessage(role="user", content="List the files"),
+            UnifiedMessage(role="assistant", content="",
+                           tool_calls=[{"id": "t1", "name": "shell", "input": {"cmd": "ls"}}]),
+            UnifiedMessage(role="user", content="",
+                           tool_results=[{"tool_use_id": "t1", "content": "a.txt", "is_error": False}]),
+        ]
+        tools = [UnifiedTool(name="shell", description="Run a command",
+                             input_schema={"type": "object", "properties": {}})]
+
+        result = build_kiro_payload(
+            messages=messages,
+            system_prompt="",
+            model_id="claude-sonnet-4",
+            tools=tools,
+            conversation_id="conv-current",
+            profile_arn="arn:aws:test",
+            thinking_config=ThinkingConfig(enabled=False),
+        )
+        current = result.payload["conversationState"]["currentMessage"]["userInputMessage"]
+        print(f"current: {current}")
+        assert current["content"] == ""
+        assert current["userInputMessageContext"]["toolResults"]
+
+    def test_current_message_carrying_nothing_gets_filler(self):
+        """
+        What it does: A current turn with nothing at all gets filler.
+        Goal: Kiro rejects it otherwise, so the request would fail entirely.
+        """
+        messages = [
+            UnifiedMessage(role="user", content="Hello"),
+            UnifiedMessage(role="assistant", content="Hi"),
+            UnifiedMessage(role="user", content=""),
+        ]
+        result = build_kiro_payload(
+            messages=messages,
+            system_prompt="",
+            model_id="claude-sonnet-4",
+            tools=None,
+            conversation_id="conv-empty-current",
+            profile_arn="arn:aws:test",
+            thinking_config=ThinkingConfig(enabled=False),
+        )
+        current = result.payload["conversationState"]["currentMessage"]["userInputMessage"]
+        print(f"current: {current}")
+        assert current["content"] == EMPTY_TURN_PLACEHOLDER
