@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
-from kiro.config import HIDDEN_MODELS
+from kiro.config import HIDDEN_MODELS, DEFAULT_REASONING_EFFORT
 from kiro.model_resolver import get_model_id_for_kiro
 from kiro.models_anthropic import (
     AnthropicMessagesRequest,
@@ -42,6 +42,9 @@ from kiro.converters_core import (
     build_kiro_payload,
     extract_text_content,
     extract_images_from_content,
+    reasoning_effort_to_budget,
+    normalize_native_effort,
+    budget_to_effort,
 )
 
 
@@ -289,12 +292,39 @@ def convert_anthropic_messages(
         tool_calls = None
         tool_results = None
         images = None
+        reasoning_content = None
+        reasoning_signature = None
 
         if role == "assistant":
             # Assistant messages may contain tool_use blocks
             tool_calls = extract_tool_uses_from_anthropic_content(content)
             if tool_calls:
                 total_tool_calls += len(tool_calls)
+
+            # Assistant messages may contain thinking blocks with signatures.
+            # Anthropic allows several, but Kiro reasoningContent holds one text and
+            # signature pair, so take the first complete pair. Falling back to a
+            # signature-less block keeps the text rather than losing thinking entirely.
+            if isinstance(content, list):
+                for block in content:
+                    b_type = block.get("type") if isinstance(block, dict) else getattr(block, "type", None)
+                    if b_type != "thinking":
+                        continue
+                    
+                    block_thinking = block.get("thinking") if isinstance(block, dict) else getattr(block, "thinking", None)
+                    block_signature = block.get("signature") if isinstance(block, dict) else getattr(block, "signature", None)
+                    if not block_thinking:
+                        continue
+                    
+                    if block_signature:
+                        reasoning_content = block_thinking
+                        reasoning_signature = block_signature
+                        break
+                    
+                    # Remember the first unsigned block in case no signed one follows
+                    if reasoning_content is None:
+                        reasoning_content = block_thinking
+                        reasoning_signature = block_signature
 
         elif role == "user":
             # User messages may contain tool_result blocks and images
@@ -323,6 +353,8 @@ def convert_anthropic_messages(
             tool_calls=tool_calls if tool_calls else None,
             tool_results=tool_results if tool_results else None,
             images=images if images else None,
+            reasoning_content=reasoning_content,
+            reasoning_signature=reasoning_signature,
         )
         unified_messages.append(unified_msg)
 
@@ -370,14 +402,53 @@ def convert_anthropic_tools(
     return unified_tools if unified_tools else None
 
 
+def extract_thinking_display(request: AnthropicMessagesRequest) -> Optional[str]:
+    """
+    Extracts thinking.display from an Anthropic request.
+    
+    Anthropic uses thinking.display to say whether reasoning text should come back:
+    "summarized" returns a readable summary, "omitted" returns none. The gateway acts
+    only on "omitted", because treating an absent value as omitted (the Anthropic
+    default on current models) would suppress the reasoning this gateway exists to
+    surface.
+    
+    Args:
+        request: Anthropic MessagesRequest
+    
+    Returns:
+        Normalized display value, or None when the request did not set one
+    
+    Examples:
+        >>> request.thinking = {"type": "adaptive", "display": "omitted"}
+        >>> extract_thinking_display(request)
+        'omitted'
+    """
+    if not isinstance(request.thinking, dict):
+        return None
+    
+    display = request.thinking.get("display")
+    if not display:
+        return None
+    
+    return str(display).strip().lower()
+
+
 def extract_thinking_config_from_anthropic(request: AnthropicMessagesRequest) -> ThinkingConfig:
     """
     Extract thinking configuration from Anthropic request.
     
-    Handles thinking parameter:
-    - {"type": "enabled", "budget_tokens": N} → enabled with budget
-    - {"type": "disabled"} → disabled
-    - None → enabled with default budget
+    Handles Anthropic extended thinking parameters:
+    1. Standard thinking parameter:
+       - {"type": "enabled", "budget_tokens": N} → enabled with explicit budget
+       - {"type": "disabled"} → disabled (no thinking tags injected)
+       - {"type": "adaptive"} → enabled with adaptive effort level from output_config
+    2. Output configuration parameter (Claude Code / Anthropic API):
+       - output_config={"effort": "low" | "medium" | "high" | "max"} → percentage-based budget
+       - output_config={"effort": "none"} → disabled
+    3. Direct effort in thinking parameter:
+       - {"type": "adaptive"|"enabled", "effort": "..."} → percentage-based budget
+    4. Fallback defaults:
+       - None specified → enabled with default budget (FAKE_REASONING_MAX_TOKENS)
     
     Args:
         request: Anthropic MessagesRequest
@@ -391,38 +462,107 @@ def extract_thinking_config_from_anthropic(request: AnthropicMessagesRequest) ->
         >>> extract_thinking_config_from_anthropic(request)
         ThinkingConfig(enabled=True, budget_tokens=None)
         
-        >>> # Explicitly disabled
+        >>> # Explicitly disabled via thinking
         >>> request.thinking = {"type": "disabled"}
         >>> extract_thinking_config_from_anthropic(request)
         ThinkingConfig(enabled=False, budget_tokens=None)
         
-        >>> # Enabled with custom budget
+        >>> # Explicitly disabled via output_config
+        >>> request.output_config = {"effort": "none"}
+        >>> extract_thinking_config_from_anthropic(request)
+        ThinkingConfig(enabled=False, budget_tokens=None)
+        
+        >>> # Enabled with explicit budget
         >>> request.thinking = {"type": "enabled", "budget_tokens": 8000}
         >>> extract_thinking_config_from_anthropic(request)
         ThinkingConfig(enabled=True, budget_tokens=8000)
+        
+        >>> # Claude Code CLI adaptive thinking with effort level
+        >>> request.thinking = {"type": "adaptive"}
+        >>> request.output_config = {"effort": "max"}
+        >>> request.max_tokens = 64000
+        >>> extract_thinking_config_from_anthropic(request)
+        ThinkingConfig(enabled=True, budget_tokens=60800)  # 95% of 64000
     """
-    if not request.thinking:
-        # No thinking specified → use defaults
-        return ThinkingConfig(enabled=True, budget_tokens=None)
-    
-    if not isinstance(request.thinking, dict):
-        # Invalid format → use defaults
-        return ThinkingConfig(enabled=True, budget_tokens=None)
-    
-    thinking_type = request.thinking.get("type")
-    
-    if thinking_type == "disabled":
-        # Explicitly disabled
+    # 1. Check if thinking is explicitly disabled via thinking parameter
+    if isinstance(request.thinking, dict) and request.thinking.get("type") == "disabled":
         return ThinkingConfig(enabled=False, budget_tokens=None)
     
-    if thinking_type == "enabled":
-        # Extract budget_tokens
-        budget = request.thinking.get("budget_tokens")
-        if budget:
-            logger.debug(f"Extracted thinking config from Anthropic: type='enabled', budget={budget}")
-        return ThinkingConfig(enabled=True, budget_tokens=budget)
+    # 2. Extract effort from output_config, thinking, or request attributes
+    effort = None
+    if isinstance(request.output_config, dict):
+        effort = request.output_config.get("effort")
+    if not effort and isinstance(request.thinking, dict):
+        effort = request.thinking.get("effort")
+    if not effort:
+        effort = getattr(request, "reasoning_effort", None)
+    if not effort and hasattr(request, "model_extra") and request.model_extra:
+        effort = request.model_extra.get("reasoning_effort") or request.model_extra.get("effort")
     
-    # Unknown type → use defaults
+    # 3. Check if effort explicitly disables thinking
+    if effort is not None:
+        effort_str = str(effort).strip().lower()
+        if effort_str == "none":
+            return ThinkingConfig(enabled=False, budget_tokens=None)
+    
+    # 4. Check if explicit budget_tokens is provided in thinking parameter
+    if isinstance(request.thinking, dict):
+        budget = request.thinking.get("budget_tokens")
+        if budget is not None:
+            try:
+                budget_int = int(budget)
+                if budget_int > 0:
+                    derived_effort = normalize_native_effort(effort) if effort is not None else budget_to_effort(budget_int)
+                    logger.info(
+                        f"Anthropic budget_tokens={budget_int} mapped to reasoning effort "
+                        f"'{derived_effort}'. Kiro takes an effort level, so the exact "
+                        f"token budget is not forwarded."
+                    )
+                    return ThinkingConfig(
+                        enabled=True,
+                        budget_tokens=budget_int,
+                        native_effort=derived_effort
+                    )
+                else:
+                    return ThinkingConfig(enabled=False, budget_tokens=None)
+            except (ValueError, TypeError):
+                pass
+    
+    # 5. If effort is provided, calculate percentage-based budget
+    if effort is not None:
+        effort_str = str(effort).strip().lower()
+        max_tokens = request.max_tokens or 4096
+        budget = reasoning_effort_to_budget(max_tokens, effort_str)
+        if budget <= 0:
+            return ThinkingConfig(enabled=False, budget_tokens=None)
+        
+        normalized_effort = normalize_native_effort(effort_str)
+        logger.debug(
+            f"Extracted thinking config from Anthropic: effort='{effort_str}', "
+            f"max_tokens={max_tokens}, budget={budget}, native_effort='{normalized_effort}'"
+        )
+        return ThinkingConfig(
+            enabled=True,
+            budget_tokens=budget,
+            native_effort=normalized_effort
+        )
+    
+    # 6. Adaptive thinking without an explicit effort is equivalent to omitting the
+    # thinking parameter on current Claude models, so it takes the same path as the
+    # default below rather than picking an effort of its own.
+    
+    # 7. Default configuration (check DEFAULT_REASONING_EFFORT or fallback to default)
+    if DEFAULT_REASONING_EFFORT:
+        default_effort = normalize_native_effort(DEFAULT_REASONING_EFFORT)
+        if default_effort:
+            max_tokens = request.max_tokens or 4096
+            budget = reasoning_effort_to_budget(max_tokens, default_effort)
+            return ThinkingConfig(
+                enabled=True,
+                budget_tokens=budget,
+                native_effort=default_effort
+            )
+
     return ThinkingConfig(enabled=True, budget_tokens=None)
 
 
@@ -466,6 +606,15 @@ def anthropic_to_kiro(
 
     # Extract thinking configuration from thinking parameter
     thinking_config = extract_thinking_config_from_anthropic(request)
+    
+    # Kiro has no server-side context editing, so context_management cannot be applied.
+    # Say so rather than accepting it silently: a client that believes its clearing or
+    # compaction strategy is active will size its history on a false assumption.
+    if request.context_management:
+        logger.warning(
+            "Request sets context_management, which Kiro does not support. "
+            "The field is ignored and no context editing is applied."
+        )
 
     logger.debug(
         f"Converting Anthropic request: model={request.model} -> {model_id}, "

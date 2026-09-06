@@ -524,6 +524,114 @@ class TestAnthropicMessageWithImages:
         assert message.content[1].source.url == "https://example.com/image.jpg"
 
 
+
+# ==================================================================================================
+# Tests for AnthropicMessage Roles (user, assistant, system, developer, etc.)
+# ==================================================================================================
+
+class TestAnthropicMessageRoles:
+    """
+    Tests for AnthropicMessage roles flexibility.
+    
+    Verifies that clients like Claude Code CLI sending non-standard roles
+    (e.g., 'system' or 'developer' inside messages) do not trigger 422 ValidationError.
+    """
+    
+    def test_message_with_system_role_string_content(self):
+        """
+        What it does: Verifies AnthropicMessage accepts role='system' with string content.
+        Purpose: Ensure system role messages are valid.
+        """
+        message = AnthropicMessage(role="system", content="System instruction")
+        assert message.role == "system"
+        assert message.content == "System instruction"
+
+    def test_message_with_system_role_content_blocks(self):
+        """
+        What it does: Verifies AnthropicMessage accepts role='system' with text content blocks.
+        Purpose: Ensure system reminder blocks from tools like Claude Code CLI validate.
+        """
+        message = AnthropicMessage(
+            role="system",
+            content=[{"type": "text", "text": "<system-reminder>Date is 2026-09-05</system-reminder>"}]
+        )
+        assert message.role == "system"
+        assert len(message.content) == 1
+        assert message.content[0].type == "text"
+        assert message.content[0].text == "<system-reminder>Date is 2026-09-05</system-reminder>"
+
+    def test_message_with_developer_role(self):
+        """
+        What it does: Verifies AnthropicMessage accepts role='developer'.
+        Purpose: Ensure OpenAI-style developer role messages in Anthropic format validate.
+        """
+        message = AnthropicMessage(role="developer", content="You are a developer assistant.")
+        assert message.role == "developer"
+        assert message.content == "You are a developer assistant."
+
+    def test_request_with_claude_code_cli_format(self):
+        """
+        What it does: Verifies full AnthropicMessagesRequest validates with Claude Code CLI structure.
+        Purpose: Prevent 422 Unprocessable Entity when Claude Code sends mixed user/system messages.
+        """
+        raw_data = {
+            "model": "claude-opus-5",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "<system-reminder>Today's date is 2026-09-05.</system-reminder>"},
+                        {"type": "text", "text": "<local-command-caveat>Caveat...</local-command-caveat>"}
+                    ]
+                },
+                {
+                    "role": "system",
+                    "content": [
+                        {"type": "text", "text": "Additional context"}
+                    ]
+                }
+            ],
+            "max_tokens": 1000
+        }
+        request = AnthropicMessagesRequest.model_validate(raw_data)
+        assert len(request.messages) == 2
+        assert request.messages[0].role == "user"
+        assert request.messages[1].role == "system"
+
+    def test_request_with_output_config(self):
+        """
+        What it does: Verifies AnthropicMessagesRequest accepts and exposes output_config.
+        Purpose: Ensure output_config={'effort': 'max'} validates properly.
+        """
+        raw_data = {
+            "model": "claude-opus-5",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "max_tokens": 64000,
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "max"}
+        }
+        request = AnthropicMessagesRequest.model_validate(raw_data)
+        assert request.output_config == {"effort": "max"}
+        assert request.thinking == {"type": "adaptive"}
+
+    def test_request_with_context_management(self):
+        """
+        What it does: Verifies AnthropicMessagesRequest accepts context_management.
+        Purpose: Ensure Claude Code context_management parameters validate without issue.
+        """
+        raw_data = {
+            "model": "claude-opus-5",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "max_tokens": 1000,
+            "context_management": {
+                "edits": [{"type": "clear_thinking_20251015", "keep": "all"}]
+            }
+        }
+        request = AnthropicMessagesRequest.model_validate(raw_data)
+        assert request.context_management is not None
+        assert "edits" in request.context_management
+
+
 # ==================================================================================================
 # Tests for AnthropicMessagesRequest with Image Content
 # ==================================================================================================

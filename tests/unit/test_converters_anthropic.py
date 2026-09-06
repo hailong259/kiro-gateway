@@ -980,6 +980,33 @@ class TestConvertAnthropicMessages:
         assert result[0].role == "assistant"
         assert result[0].content == "Hi there!"
 
+    def test_converts_system_role_message(self):
+        """
+        What it does: Verifies conversion of message with role='system'.
+        Purpose: Ensure non-standard role messages like system reminders are converted.
+        """
+        messages = [
+            AnthropicMessage(
+                role="system",
+                content=[{"type": "text", "text": "<system-reminder>Date: 2026-09-05</system-reminder>"}]
+            )
+        ]
+        result = convert_anthropic_messages(messages)
+        assert len(result) == 1
+        assert result[0].role == "system"
+        assert result[0].content == "<system-reminder>Date: 2026-09-05</system-reminder>"
+
+    def test_converts_developer_role_message(self):
+        """
+        What it does: Verifies conversion of message with role='developer'.
+        Purpose: Ensure developer role messages are converted to unified format.
+        """
+        messages = [AnthropicMessage(role="developer", content="Instructions")]
+        result = convert_anthropic_messages(messages)
+        assert len(result) == 1
+        assert result[0].role == "developer"
+        assert result[0].content == "Instructions"
+
     def test_converts_user_message_with_content_blocks(self):
         """
         What it does: Verifies conversion of user message with content blocks.
@@ -1569,6 +1596,44 @@ class TestAnthropicToKiro:
         assert "userInputMessage" in history[0]
         assert "assistantResponseMessage" in history[1]
 
+    def test_converts_request_with_system_role_message(self):
+        """
+        What it does: Verifies that a request with role='system' in messages converts cleanly to Kiro payload.
+        Purpose: Ensure Claude Code CLI pattern (role='system' inside messages) works end-to-end.
+        """
+        print("Setup: Request with system role message in history...")
+        request = AnthropicMessagesRequest(
+            model="claude-opus-5",
+            messages=[
+                AnthropicMessage(
+                    role="user",
+                    content=[{"type": "text", "text": "<system-reminder>Context</system-reminder>"}]
+                ),
+                AnthropicMessage(
+                    role="system",
+                    content=[{"type": "text", "text": "Additional instruction"}]
+                ),
+                AnthropicMessage(
+                    role="user",
+                    content="Hello from Claude Code"
+                ),
+            ],
+            max_tokens=1024,
+        )
+
+        print("Action: Converting to Kiro payload...")
+        with patch(
+            "kiro.converters_anthropic.get_model_id_for_kiro",
+            return_value="claude-opus-5",
+        ):
+            with patch("kiro.converters_core.FAKE_REASONING_ENABLED", False):
+                result = anthropic_to_kiro(request, "conv-123", "arn:aws:test")
+
+        print(f"Result: {result}")
+        assert "conversationState" in result
+        current_msg = result["conversationState"]["currentMessage"]["userInputMessage"]
+        assert "Hello from Claude Code" in current_msg["content"]
+
     def test_handles_tool_use_and_result_flow(self):
         """
         What it does: Verifies handling of tool use and result flow.
@@ -1852,7 +1917,180 @@ class TestExtractThinkingConfigFromAnthropic:
         print(f"Comparing: enabled={config.enabled}, budget_tokens={config.budget_tokens}")
         assert config.enabled is True
         assert config.budget_tokens is None
-    
+
+    def test_output_config_effort_low(self):
+        """
+        What it does: Verifies output_config={'effort': 'low'} maps to 20% budget.
+        Purpose: Ensure low effort calculates correct budget for Anthropic requests.
+        """
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4.5",
+            messages=[AnthropicMessage(role="user", content="test")],
+            max_tokens=10000,
+            thinking={"type": "adaptive"},
+            output_config={"effort": "low"}
+        )
+        config = extract_thinking_config_from_anthropic(request)
+        assert config.enabled is True
+        assert config.budget_tokens == 2000
+
+    def test_output_config_effort_medium(self):
+        """
+        What it does: Verifies output_config={'effort': 'medium'} maps to 50% budget.
+        Purpose: Ensure medium effort calculates correct budget for Anthropic requests.
+        """
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4.5",
+            messages=[AnthropicMessage(role="user", content="test")],
+            max_tokens=10000,
+            thinking={"type": "adaptive"},
+            output_config={"effort": "medium"}
+        )
+        config = extract_thinking_config_from_anthropic(request)
+        assert config.enabled is True
+        assert config.budget_tokens == 5000
+
+    def test_output_config_effort_high(self):
+        """
+        What it does: Verifies output_config={'effort': 'high'} maps to 80% budget.
+        Purpose: Ensure high effort calculates correct budget for Anthropic requests.
+        """
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4.5",
+            messages=[AnthropicMessage(role="user", content="test")],
+            max_tokens=10000,
+            thinking={"type": "adaptive"},
+            output_config={"effort": "high"}
+        )
+        config = extract_thinking_config_from_anthropic(request)
+        assert config.enabled is True
+        assert config.budget_tokens == 8000
+
+    def test_output_config_effort_xhigh(self):
+        """
+        What it does: Verifies output_config={'effort': 'xhigh'} maps to 95% budget.
+        Purpose: Ensure xhigh effort calculates correct budget for Anthropic requests.
+        """
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4.5",
+            messages=[AnthropicMessage(role="user", content="test")],
+            max_tokens=10000,
+            thinking={"type": "adaptive"},
+            output_config={"effort": "xhigh"}
+        )
+        config = extract_thinking_config_from_anthropic(request)
+        assert config.enabled is True
+        assert config.budget_tokens == 9500
+
+    def test_output_config_effort_max_claude_code(self):
+        """
+        What it does: Verifies output_config={'effort': 'max'} with max_tokens=64000 maps to 95% (60800 tokens).
+        Purpose: Ensure Claude Code CLI pattern (--effort max) scales to full 95% budget.
+        """
+        request = AnthropicMessagesRequest(
+            model="claude-opus-5",
+            messages=[AnthropicMessage(role="user", content="test")],
+            max_tokens=64000,
+            thinking={"type": "adaptive"},
+            output_config={"effort": "max"}
+        )
+        config = extract_thinking_config_from_anthropic(request)
+        assert config.enabled is True
+        assert config.budget_tokens == 60800
+
+    def test_output_config_effort_none(self):
+        """
+        What it does: Verifies output_config={'effort': 'none'} disables thinking.
+        Purpose: Ensure client can explicitly disable thinking via output_config.
+        """
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4.5",
+            messages=[AnthropicMessage(role="user", content="test")],
+            max_tokens=4096,
+            thinking={"type": "adaptive"},
+            output_config={"effort": "none"}
+        )
+        config = extract_thinking_config_from_anthropic(request)
+        assert config.enabled is False
+        assert config.budget_tokens is None
+
+    def test_output_config_without_thinking_parameter(self):
+        """
+        What it does: Verifies effort is recognized even when thinking parameter is omitted.
+        Purpose: Ensure robustness when clients send output_config directly.
+        """
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4.5",
+            messages=[AnthropicMessage(role="user", content="test")],
+            max_tokens=4096,
+            output_config={"effort": "high"}
+        )
+        config = extract_thinking_config_from_anthropic(request)
+        assert config.enabled is True
+        assert config.budget_tokens == 3276
+
+    def test_thinking_with_internal_effort_field(self):
+        """
+        What it does: Verifies effort inside thinking object is extracted.
+        Purpose: Support clients that nest effort inside thinking dict.
+        """
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4.5",
+            messages=[AnthropicMessage(role="user", content="test")],
+            max_tokens=4096,
+            thinking={"type": "adaptive", "effort": "medium"}
+        )
+        config = extract_thinking_config_from_anthropic(request)
+        assert config.enabled is True
+        assert config.budget_tokens == 2048
+
+    def test_explicit_budget_precedence_over_effort(self):
+        """
+        What it does: Verifies explicit budget_tokens takes precedence over output_config.effort.
+        Purpose: Exact token budgets should not be overridden by percentage effort.
+        """
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4.5",
+            messages=[AnthropicMessage(role="user", content="test")],
+            max_tokens=64000,
+            thinking={"type": "enabled", "budget_tokens": 12000},
+            output_config={"effort": "low"}
+        )
+        config = extract_thinking_config_from_anthropic(request)
+        assert config.enabled is True
+        assert config.budget_tokens == 12000
+
+    def test_thinking_disabled_precedence_over_effort(self):
+        """
+        What it does: Verifies thinking.type='disabled' overrides any effort setting.
+        Purpose: Explicit disable always wins.
+        """
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4.5",
+            messages=[AnthropicMessage(role="user", content="test")],
+            max_tokens=64000,
+            thinking={"type": "disabled"},
+            output_config={"effort": "max"}
+        )
+        config = extract_thinking_config_from_anthropic(request)
+        assert config.enabled is False
+        assert config.budget_tokens is None
+
+    def test_case_insensitive_and_whitespace_effort(self):
+        """
+        What it does: Verifies effort normalization handles uppercase and whitespace.
+        Purpose: Ensure robust parsing of effort strings like '  MAX  '.
+        """
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4.5",
+            messages=[AnthropicMessage(role="user", content="test")],
+            max_tokens=10000,
+            output_config={"effort": "  MAX  "}
+        )
+        config = extract_thinking_config_from_anthropic(request)
+        assert config.enabled is True
+        assert config.budget_tokens == 9500
+
 
 
 class TestAnthropicToKiroIntegration:
@@ -1860,10 +2098,33 @@ class TestAnthropicToKiroIntegration:
     
     def test_extracts_and_passes_thinking_config(self):
         """
-        What it does: Verifies anthropic_to_kiro extracts thinking_config and passes to core
+        What it does: Verifies anthropic_to_kiro extracts thinking_config and applies native reasoning
         Purpose: Ensure end-to-end thinking configuration flow works
         """
         print("Creating request with thinking budget...")
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4.7",
+            messages=[AnthropicMessage(role="user", content="Test message")],
+            max_tokens=1024,
+            thinking={"type": "enabled", "budget_tokens": 6000}
+        )
+        
+        print("Calling anthropic_to_kiro with native reasoning...")
+        with patch("kiro.converters_anthropic.get_model_id_for_kiro", return_value="claude-opus-4.7"):
+            payload = anthropic_to_kiro(request, "test-conv-123", "arn:aws:test")
+        
+        # Native reasoning creates additionalModelRequestFields
+        assert "additionalModelRequestFields" in payload
+        assert payload["additionalModelRequestFields"] == {"output_config": {"effort": "medium"}}
+        user_input = payload["conversationState"]["currentMessage"]["userInputMessage"]
+        assert "Test message" in user_input["content"]
+        assert "<thinking_mode>" not in user_input["content"]
+
+    def test_extracts_and_passes_thinking_config_fallback_fake_reasoning(self):
+        """
+        What it does: Verifies fallback to fake reasoning tag injection when native reasoning is disabled.
+        Purpose: Ensure backward compatibility when NATIVE_REASONING_ENABLED=False.
+        """
         request = AnthropicMessagesRequest(
             model="claude-sonnet-4.5",
             messages=[AnthropicMessage(role="user", content="Test message")],
@@ -1871,16 +2132,355 @@ class TestAnthropicToKiroIntegration:
             thinking={"type": "enabled", "budget_tokens": 6000}
         )
         
-        print("Calling anthropic_to_kiro...")
         with patch("kiro.converters_anthropic.get_model_id_for_kiro", return_value="claude-sonnet-4.5"):
-            with patch("kiro.converters_core.FAKE_REASONING_ENABLED", True):
-                with patch("kiro.converters_core.FAKE_REASONING_BUDGET_CAP", 10000):
-                    payload = anthropic_to_kiro(request, "test-conv-123", "arn:aws:test")
+            with patch("kiro.converters_core.NATIVE_REASONING_ENABLED", False):
+                with patch("kiro.converters_core.FAKE_REASONING_ENABLED", True):
+                    with patch("kiro.converters_core.FAKE_REASONING_BUDGET_CAP", 10000):
+                        payload = anthropic_to_kiro(request, "test-conv-123", "arn:aws:test")
         
-        print("Extracting userInputMessage content...")
         user_input = payload["conversationState"]["currentMessage"]["userInputMessage"]
         content = user_input["content"]
-        
-        print(f"Checking for <max_thinking_length>6000</max_thinking_length>...")
         assert "<max_thinking_length>6000</max_thinking_length>" in content
         assert "<thinking_mode>enabled</thinking_mode>" in content
+        assert "additionalModelRequestFields" not in payload
+
+    def test_claude_code_cli_effort_max_end_to_end(self):
+        """
+        What it does: Verifies full end-to-end translation of Claude Code CLI request with effort='max'.
+        Purpose: Ensure native reasoning additionalModelRequestFields output_config.effort='max' is generated.
+        """
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4.7",
+            messages=[AnthropicMessage(role="user", content="Tell me a joke")],
+            max_tokens=64000,
+            thinking={"type": "adaptive"},
+            output_config={"effort": "max"}
+        )
+        
+        with patch("kiro.converters_anthropic.get_model_id_for_kiro", return_value="claude-opus-4.7"):
+            payload = anthropic_to_kiro(request, "test-conv-claude-code", "arn:aws:test")
+        
+        assert "additionalModelRequestFields" in payload
+        assert payload["additionalModelRequestFields"] == {"output_config": {"effort": "max"}}
+        user_input = payload["conversationState"]["currentMessage"]["userInputMessage"]
+        assert "Tell me a joke" in user_input["content"]
+        assert "<thinking_mode>" not in user_input["content"]
+
+    def test_claude_code_cli_effort_low_end_to_end(self):
+        """
+        What it does: Verifies full end-to-end translation of Claude Code CLI request with effort='low'.
+        Purpose: Ensure native reasoning additionalModelRequestFields output_config.effort='low' is generated.
+        """
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4.7",
+            messages=[AnthropicMessage(role="user", content="Quick summary")],
+            max_tokens=64000,
+            thinking={"type": "adaptive"},
+            output_config={"effort": "low"}
+        )
+        
+        with patch("kiro.converters_anthropic.get_model_id_for_kiro", return_value="claude-opus-4.7"):
+            payload = anthropic_to_kiro(request, "test-conv-claude-code-low", "arn:aws:test")
+        
+        assert "additionalModelRequestFields" in payload
+        assert payload["additionalModelRequestFields"] == {"output_config": {"effort": "low"}}
+        user_input = payload["conversationState"]["currentMessage"]["userInputMessage"]
+        assert "Quick summary" in user_input["content"]
+        assert "<thinking_mode>" not in user_input["content"]
+
+
+class TestAnthropicNativeReasoningSchema:
+    """
+    Tests that the Anthropic endpoint also derives the native reasoning schema
+    from the resolved Kiro model rather than assuming Claude.
+    """
+
+    def _payload(self, model):
+        from kiro.converters_anthropic import anthropic_to_kiro
+        request = AnthropicMessagesRequest(
+            model=model,
+            max_tokens=4096,
+            messages=[{"role": "user", "content": "Test"}],
+            output_config={"effort": "high"},
+        )
+        return anthropic_to_kiro(request, "conv-anthropic-schema", "arn:aws:test")
+
+    def test_claude_model_uses_output_config_schema(self):
+        """
+        What it does: A Claude model on the Anthropic endpoint takes output_config.
+        Goal: Baseline for the resolved-model rule.
+        """
+        fields = self._payload("claude-opus-4.7").get("additionalModelRequestFields")
+        print(f"additionalModelRequestFields: {fields}")
+        assert fields == {"output_config": {"effort": "high"}}, f"got {fields}"
+
+    def test_non_claude_model_uses_reasoning_schema(self):
+        """
+        What it does: A non-Claude Kiro model takes the reasoning schema here too.
+        Goal: The Anthropic endpoint can address any Kiro model, not only Claude.
+
+        No non-Claude Kiro model currently accepts additionalModelRequestFields at
+        all, so the denylist is cleared here to keep the schema branch covered.
+        """
+        with patch("kiro.converters_core.NATIVE_REASONING_UNSUPPORTED_MODELS", []):
+            fields = self._payload("deepseek-3.2").get("additionalModelRequestFields")
+        print(f"additionalModelRequestFields: {fields}")
+        assert fields == {"reasoning": {"effort": "high"}}, f"got {fields}"
+
+
+class TestUnknownEffortNeverReachesKiro:
+    """
+    Tests that an effort value Kiro does not accept is not forwarded.
+
+    output_config is a free-form dict on the request model, so any string can arrive.
+    """
+
+    def test_unknown_effort_is_not_sent_as_native_effort(self):
+        """
+        What it does: An unrecognized effort produces no native reasoning field.
+        Goal: Forwarding it yields an upstream validation error the client cannot act on.
+        """
+        from kiro.converters_anthropic import anthropic_to_kiro
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4.5",
+            max_tokens=4096,
+            messages=[{"role": "user", "content": "Test"}],
+            output_config={"effort": "ultra"},
+        )
+        payload = anthropic_to_kiro(request, "conv-unknown-effort", "arn:aws:test")
+
+        fields = payload.get("additionalModelRequestFields")
+        print(f"additionalModelRequestFields: {fields}")
+        assert fields is None, f"unknown effort was forwarded: {fields}"
+
+    def test_known_effort_is_still_sent(self):
+        """
+        What it does: A supported effort still reaches Kiro.
+        Goal: Guard against the validation blocking valid requests.
+        """
+        from kiro.converters_anthropic import anthropic_to_kiro
+        request = AnthropicMessagesRequest(
+            model="claude-opus-4.7",
+            max_tokens=4096,
+            messages=[{"role": "user", "content": "Test"}],
+            output_config={"effort": "medium"},
+        )
+        payload = anthropic_to_kiro(request, "conv-known-effort", "arn:aws:test")
+
+        fields = payload.get("additionalModelRequestFields")
+        print(f"additionalModelRequestFields: {fields}")
+        assert fields == {"output_config": {"effort": "medium"}}, f"got {fields}"
+
+
+class TestMultipleThinkingBlocksInOneMessage:
+    """
+    Tests thinking extraction when an assistant message carries several thinking blocks.
+
+    Anthropic allows more than one, but Kiro reasoningContent holds a single
+    text and signature pair, so a complete pair must win.
+    """
+
+    def test_later_block_without_signature_does_not_clobber_a_complete_pair(self):
+        """
+        What it does: A signature-less later block leaves the earlier complete pair intact.
+        Goal: The loop reassigned on every match, so a trailing block erased the signature.
+        """
+        messages = [
+            AnthropicMessage(role="assistant", content=[
+                {"type": "thinking", "thinking": "first thoughts", "signature": "SIG1"},
+                {"type": "thinking", "thinking": "second thoughts"},
+            ])
+        ]
+        unified = convert_anthropic_messages(messages)
+
+        print(f"reasoning: {unified[0].reasoning_content!r} / {unified[0].reasoning_signature!r}")
+        assert unified[0].reasoning_content == "first thoughts"
+        assert unified[0].reasoning_signature == "SIG1"
+
+    def test_first_complete_pair_is_used(self):
+        """
+        What it does: The first block carrying both fields is the one used.
+        Goal: Selection must be deterministic rather than last-match-wins.
+        """
+        messages = [
+            AnthropicMessage(role="assistant", content=[
+                {"type": "thinking", "thinking": "first", "signature": "SIG1"},
+                {"type": "thinking", "thinking": "second", "signature": "SIG2"},
+            ])
+        ]
+        unified = convert_anthropic_messages(messages)
+
+        print(f"reasoning: {unified[0].reasoning_content!r} / {unified[0].reasoning_signature!r}")
+        assert unified[0].reasoning_content == "first"
+        assert unified[0].reasoning_signature == "SIG1"
+
+    def test_signature_less_block_alone_still_yields_text(self):
+        """
+        What it does: A lone block without a signature still contributes its text.
+        Goal: Losing the text as well would be a bigger regression than a missing signature.
+        """
+        messages = [
+            AnthropicMessage(role="assistant", content=[
+                {"type": "thinking", "thinking": "unsigned thoughts"},
+            ])
+        ]
+        unified = convert_anthropic_messages(messages)
+
+        print(f"reasoning: {unified[0].reasoning_content!r} / {unified[0].reasoning_signature!r}")
+        assert unified[0].reasoning_content == "unsigned thoughts"
+        assert not unified[0].reasoning_signature
+
+
+class TestAdaptiveThinkingMatchesOmittedThinking:
+    """
+    Tests that adaptive thinking without an explicit effort behaves like omitting
+    the thinking parameter.
+
+    On current Claude models, omitting thinking is equivalent to adaptive, so the two
+    must not land on different reasoning paths. Adaptive used to hardcode a high
+    effort and switch to native reasoning while the omitted case did not.
+    """
+
+    def _config(self, thinking, default_effort):
+        from kiro import converters_anthropic as ca
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4.5",
+            max_tokens=8000,
+            messages=[{"role": "user", "content": "Test"}],
+            thinking=thinking,
+        )
+        with patch.object(ca, "DEFAULT_REASONING_EFFORT", default_effort):
+            return ca.extract_thinking_config_from_anthropic(request)
+
+    def test_adaptive_without_effort_matches_omitted_thinking(self):
+        """
+        What it does: With no operator default, adaptive and omitted agree.
+        Goal: The two paths described the same client intent but diverged.
+        """
+        adaptive = self._config({"type": "adaptive"}, None)
+        omitted = self._config(None, None)
+
+        print(f"adaptive={adaptive}")
+        print(f"omitted ={omitted}")
+        assert adaptive == omitted
+
+    def test_adaptive_follows_operator_default_effort(self):
+        """
+        What it does: An operator default effort applies to adaptive thinking.
+        Goal: Operator opt-in is what enables native reasoning, not a hardcoded level.
+        """
+        adaptive = self._config({"type": "adaptive"}, "medium")
+
+        print(f"adaptive with operator default: {adaptive}")
+        assert adaptive.enabled is True
+        assert adaptive.native_effort == "medium"
+
+    def test_adaptive_with_explicit_effort_still_uses_it(self):
+        """
+        What it does: An explicit effort alongside adaptive is still honored.
+        Goal: Guard against the consistency fix swallowing an explicit client effort.
+        """
+        from kiro import converters_anthropic as ca
+        request = AnthropicMessagesRequest(
+            model="claude-sonnet-4.5",
+            max_tokens=8000,
+            messages=[{"role": "user", "content": "Test"}],
+            thinking={"type": "adaptive"},
+            output_config={"effort": "low"},
+        )
+        with patch.object(ca, "DEFAULT_REASONING_EFFORT", None):
+            config = ca.extract_thinking_config_from_anthropic(request)
+
+        print(f"config: {config}")
+        assert config.native_effort == "low"
+
+
+class TestExtractThinkingDisplay:
+    """Tests for extract_thinking_display()."""
+
+    def _request(self, thinking):
+        return AnthropicMessagesRequest(
+            model="claude-sonnet-4.5",
+            max_tokens=1024,
+            messages=[{"role": "user", "content": "Test"}],
+            thinking=thinking,
+        )
+
+    def test_returns_display_value_when_present(self):
+        """
+        What it does: The display value is read out of the thinking parameter.
+        Goal: The streaming layer needs it to honor a request for no reasoning text.
+        """
+        from kiro.converters_anthropic import extract_thinking_display
+        assert extract_thinking_display(
+            self._request({"type": "adaptive", "display": "omitted"})
+        ) == "omitted"
+        assert extract_thinking_display(
+            self._request({"type": "adaptive", "display": "summarized"})
+        ) == "summarized"
+
+    def test_returns_none_when_absent(self):
+        """
+        What it does: A thinking parameter without display yields None.
+        Goal: None must mean keep the configured gateway behavior.
+        """
+        from kiro.converters_anthropic import extract_thinking_display
+        assert extract_thinking_display(self._request({"type": "adaptive"})) is None
+        assert extract_thinking_display(self._request(None)) is None
+
+    def test_normalizes_casing_and_whitespace(self):
+        """
+        What it does: Surrounding whitespace and casing are normalized.
+        Goal: A client sending a padded value should still be honored.
+        """
+        from kiro.converters_anthropic import extract_thinking_display
+        assert extract_thinking_display(
+            self._request({"type": "adaptive", "display": "  OMITTED "})
+        ) == "omitted"
+
+
+class TestContextManagementIsNotSilentlyIgnored:
+    """
+    Tests that an unsupported context_management request is reported.
+
+    Kiro offers no server-side context editing, so the field cannot be honored.
+    Accepting it without a word lets a client believe its context strategy is active.
+    """
+
+    def _convert(self, context_management):
+        from loguru import logger
+        from kiro.converters_anthropic import anthropic_to_kiro
+        body = {
+            "model": "claude-sonnet-4.5",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "Test"}],
+        }
+        if context_management is not None:
+            body["context_management"] = context_management
+        request = AnthropicMessagesRequest(**body)
+
+        captured = []
+        sink_id = logger.add(lambda m: captured.append(str(m)), level="WARNING")
+        try:
+            anthropic_to_kiro(request, "conv-ctx", "arn:aws:test")
+        finally:
+            logger.remove(sink_id)
+        return captured
+
+    def test_context_management_request_is_reported(self):
+        """
+        What it does: A context_management request produces a warning naming the field.
+        Goal: Silent acceptance misleads the client about what the gateway applied.
+        """
+        captured = self._convert({"edits": [{"type": "clear_thinking_20251015"}]})
+        print(f"warnings: {captured}")
+        assert any("context_management" in line for line in captured), f"no warning: {captured}"
+
+    def test_no_warning_when_context_management_absent(self):
+        """
+        What it does: A request without the field logs no such warning.
+        Goal: Guard against warning on every request.
+        """
+        captured = self._convert(None)
+        print(f"warnings: {captured}")
+        assert not any("context_management" in line for line in captured), f"unexpected: {captured}"

@@ -33,7 +33,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
-from kiro.config import HIDDEN_MODELS
+from kiro.config import HIDDEN_MODELS, DEFAULT_REASONING_EFFORT
 from kiro.model_resolver import get_model_id_for_kiro
 from kiro.models_openai import ChatMessage, ChatCompletionRequest, Tool
 
@@ -44,6 +44,10 @@ from kiro.converters_core import (
     UnifiedMessage,
     UnifiedTool,
     ThinkingConfig,
+    REASONING_EFFORT_PERCENTAGES,
+    reasoning_effort_to_budget,
+    normalize_native_effort,
+    budget_to_effort,
     build_kiro_payload as core_build_kiro_payload,
 )
 
@@ -206,11 +210,19 @@ def convert_openai_messages_to_unified(messages: List[ChatMessage]) -> Tuple[str
             tool_calls = None
             tool_results = None
             images = None
+            reasoning_content = None
+            reasoning_signature = None
 
             if msg.role == "assistant":
                 tool_calls = _extract_tool_calls_from_openai(msg) or None
                 if tool_calls:
                     total_tool_calls += len(tool_calls)
+                reasoning_content = getattr(msg, "reasoning_content", None)
+                if not reasoning_content and hasattr(msg, "model_extra") and msg.model_extra:
+                    reasoning_content = msg.model_extra.get("reasoning_content")
+                reasoning_signature = getattr(msg, "reasoning_signature", None)
+                if not reasoning_signature and hasattr(msg, "model_extra") and msg.model_extra:
+                    reasoning_signature = msg.model_extra.get("reasoning_signature")
             elif msg.role == "user":
                 tool_results = _extract_tool_results_from_openai(msg.content) or None
                 if tool_results:
@@ -225,7 +237,9 @@ def convert_openai_messages_to_unified(messages: List[ChatMessage]) -> Tuple[str
                 content=extract_text_content(msg.content),
                 tool_calls=tool_calls,
                 tool_results=tool_results,
-                images=images
+                images=images,
+                reasoning_content=reasoning_content,
+                reasoning_signature=reasoning_signature,
             )
             processed.append(unified_msg)
     
@@ -297,44 +311,13 @@ def convert_openai_tools_to_unified(tools: Optional[List[Tool]]) -> Optional[Lis
 # Thinking Configuration Extraction
 # ==================================================================================================
 
-def reasoning_effort_to_budget(max_tokens: int, effort: str) -> int:
-    """
-    Convert reasoning_effort to thinking budget (production-grade mapping).
-    
-    Uses percentage-based approach that adapts to different max_tokens limits.
-    This ensures that thinking budget scales proportionally with the output limit.
-    
-    Args:
-        max_tokens: Maximum output tokens for the request
-        effort: Reasoning effort level ("none", "minimal", "low", "medium", "high", "xhigh")
-    
-    Returns:
-        Thinking budget in tokens
-    
-    Examples:
-        >>> reasoning_effort_to_budget(4096, "high")
-        3276  # 80% of 4096
-        >>> reasoning_effort_to_budget(10000, "medium")
-        5000  # 50% of 10000
-    """
-    percent = {
-        "none": 0.0,      # 0% - thinking disabled (handled separately)
-        "minimal": 0.10,  # 10% - minimal reasoning
-        "low": 0.20,      # 20% - quick reasoning
-        "medium": 0.50,   # 50% - balanced reasoning
-        "high": 0.80,     # 80% - deep reasoning
-        "xhigh": 0.95,    # 95% - maximum reasoning depth
-    }
-    return int(max_tokens * percent[effort])
-
-
 def extract_thinking_config_from_openai(request: ChatCompletionRequest) -> ThinkingConfig:
     """
     Extract thinking configuration from OpenAI request.
     
     Handles reasoning_effort parameter:
     - "none" → disabled (no thinking tags injected)
-    - "minimal", "low", "medium", "high", "xhigh" → enabled with percentage-based budget
+    - "minimal", "low", "medium", "high", "xhigh", "max" → enabled with percentage-based budget
     - None (not specified) → enabled with default budget
     
     Args:
@@ -361,10 +344,23 @@ def extract_thinking_config_from_openai(request: ChatCompletionRequest) -> Think
         ThinkingConfig(enabled=True, budget_tokens=3276)  # 80% of 4096
     """
     if not request.reasoning_effort:
-        # No reasoning_effort specified → use defaults
+        # Check if DEFAULT_REASONING_EFFORT is configured
+        if DEFAULT_REASONING_EFFORT:
+            default_effort = normalize_native_effort(DEFAULT_REASONING_EFFORT)
+            if default_effort:
+                max_tokens = request.max_tokens or request.max_completion_tokens or 4096
+                budget = reasoning_effort_to_budget(max_tokens, default_effort)
+                # schema_path is left unset: only build_kiro_payload knows the resolved
+                # Kiro model id, and aliases like "auto" hide the backing model.
+                return ThinkingConfig(
+                    enabled=True,
+                    budget_tokens=budget,
+                    native_effort=default_effort
+                )
         return ThinkingConfig(enabled=True, budget_tokens=None)
     
-    if request.reasoning_effort == "none":
+    effort = str(request.reasoning_effort).strip().lower()
+    if effort == "none":
         # Explicitly disabled
         return ThinkingConfig(enabled=False, budget_tokens=None)
     
@@ -376,14 +372,23 @@ def extract_thinking_config_from_openai(request: ChatCompletionRequest) -> Think
         # NOT DEFAULT_MAX_INPUT_TOKENS (200000) - that's for INPUT
         max_tokens = 4096  # Standard output limit
     
-    budget = reasoning_effort_to_budget(max_tokens, request.reasoning_effort)
+    budget = reasoning_effort_to_budget(max_tokens, effort)
+    if budget <= 0:
+        return ThinkingConfig(enabled=False, budget_tokens=None)
     
+    normalized_effort = normalize_native_effort(effort)
     logger.debug(
-        f"Extracted thinking config from OpenAI: reasoning_effort='{request.reasoning_effort}', "
-        f"max_tokens={max_tokens}, budget={budget}"
+        f"Extracted thinking config from OpenAI: reasoning_effort='{effort}', "
+        f"max_tokens={max_tokens}, budget={budget}, native_effort='{normalized_effort}'"
     )
     
-    return ThinkingConfig(enabled=True, budget_tokens=budget)
+    # schema_path is left unset so build_kiro_payload can resolve it from the
+    # resolved Kiro model id rather than the client-supplied model name.
+    return ThinkingConfig(
+        enabled=True,
+        budget_tokens=budget,
+        native_effort=normalized_effort
+    )
 
 
 # ==================================================================================================

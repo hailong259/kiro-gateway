@@ -144,11 +144,16 @@ class DebugLogger:
         self._setup_app_logs_capture()
 
         if self._is_immediate_write():
-            # "all" mode - clear folder and recreate
+            # "all" mode - clear folder contents
             try:
                 if self.debug_dir.exists():
-                    shutil.rmtree(self.debug_dir)
-                self.debug_dir.mkdir(parents=True, exist_ok=True)
+                    for item in self.debug_dir.iterdir():
+                        if item.is_dir():
+                            shutil.rmtree(item)
+                        else:
+                            item.unlink()
+                else:
+                    self.debug_dir.mkdir(parents=True, exist_ok=True)
                 logger.debug(f"[DebugLogger] Directory {self.debug_dir} cleared for new request.")
             except Exception as e:
                 logger.error(f"[DebugLogger] Error preparing directory: {e}")

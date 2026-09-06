@@ -183,11 +183,11 @@ class AnthropicMessage(BaseModel):
     Message in Anthropic format.
 
     Attributes:
-        role: Message role (user or assistant)
+        role: Message role (e.g., user, assistant, system)
         content: Message content (string or list of content blocks)
     """
 
-    role: Literal["user", "assistant"]
+    role: str
     content: Union[str, List[ContentBlock]]
 
     model_config = {"extra": "allow"}
@@ -324,6 +324,17 @@ class AnthropicMessagesRequest(BaseModel):
     # Extended thinking (official Anthropic parameter)
     thinking: Optional[Dict[str, Any]] = None
 
+    # Output configuration (e.g., effort: low, medium, high, max).
+    # effort is mapped to a Kiro native reasoning level in converters_anthropic.
+    # Note: Anthropic places xhigh between high and max; Kiro accepts four levels,
+    # so xhigh folds into max.
+    output_config: Optional[Dict[str, Any]] = None
+
+    # Context management (e.g., clear_tool_uses, clear_thinking, compact).
+    # Accepted for request compatibility but NOT applied: Kiro offers no server-side
+    # context editing. A request that sets it is logged as a warning.
+    context_management: Optional[Dict[str, Any]] = None
+
     # Tools
     tools: Optional[List[AnthropicTool]] = None
     tool_choice: Optional[Union[ToolChoice, Dict[str, Any]]] = None
@@ -360,6 +371,8 @@ class AnthropicCountTokensRequest(BaseModel):
     # Optional parameters - only those that affect token count
     system: Optional[SystemPrompt] = None
     tools: Optional[List[AnthropicTool]] = None
+    thinking: Optional[Dict[str, Any]] = None
+    output_config: Optional[Dict[str, Any]] = None
     
     model_config = {"extra": "allow"}
 

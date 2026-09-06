@@ -1694,6 +1694,18 @@ class TestReasoningEffortToBudget:
         
         print(f"Comparing: expected={expected}, got={result}")
         assert result == expected
+
+    def test_max_returns_95_percent(self):
+        """
+        What it does: Verifies reasoning_effort='max' returns 95%
+        Purpose: Ensure max reasoning level uses 95% budget (Anthropic / kiro-cli alias)
+        """
+        print("Testing reasoning_effort='max' with max_tokens=4096...")
+        result = reasoning_effort_to_budget(4096, "max")
+        expected = int(4096 * 0.95)
+        
+        print(f"Comparing: expected={expected}, got={result}")
+        assert result == expected
     
     def test_adapts_to_different_max_tokens(self):
         """
@@ -1836,39 +1848,150 @@ class TestExtractThinkingConfigFromOpenAI:
         print(f"Comparing: budget_tokens={config.budget_tokens}, expected={expected_budget}")
         assert config.budget_tokens == expected_budget
 
+    def test_reasoning_effort_max(self):
+        """
+        What it does: Verifies reasoning_effort='max' extracts 95% budget
+        Purpose: Ensure OpenAI converter correctly supports max effort level
+        """
+        request = ChatCompletionRequest(
+            model="claude-sonnet-4.5",
+            messages=[ChatMessage(role="user", content="test")],
+            max_tokens=10000,
+            reasoning_effort="max"
+        )
+        config = extract_thinking_config_from_openai(request)
+        assert config.enabled is True
+        assert config.budget_tokens == 9500
+
 
 class TestBuildKiroPayloadIntegration:
     """Integration tests for build_kiro_payload with thinking config."""
     
-    def test_extracts_and_passes_thinking_config(self, monkeypatch):
+    def test_extracts_and_passes_thinking_config(self):
         """
-        What it does: Verifies build_kiro_payload extracts thinking_config and passes to core
+        What it does: Verifies build_kiro_payload extracts thinking_config and applies native reasoning
         Purpose: Ensure end-to-end thinking configuration flow works
         """
-        print("Setting up mocks...")
+        print("Creating request with reasoning_effort='medium', max_tokens=8000...")
+        request = ChatCompletionRequest(
+            model="claude-opus-4.7",
+            messages=[ChatMessage(role="user", content="Test message")],
+            max_tokens=8000,
+            reasoning_effort="medium"
+        )
+        
+        print("Calling build_kiro_payload with native reasoning...")
+        with patch("kiro.converters_openai.get_model_id_for_kiro", return_value="claude-opus-4.7"):
+            payload = build_kiro_payload(
+                request_data=request,
+                conversation_id="test-conv-123",
+                profile_arn="arn:aws:test"
+            )
+        
+        # Native reasoning creates additionalModelRequestFields
+        assert "additionalModelRequestFields" in payload
+        assert payload["additionalModelRequestFields"] == {"output_config": {"effort": "medium"}}
+        user_input = payload["conversationState"]["currentMessage"]["userInputMessage"]
+        assert "Test message" in user_input["content"]
+        assert "<thinking_mode>" not in user_input["content"]
+
+    def test_build_kiro_payload_with_effort_max(self):
+        """
+        What it does: Verifies build_kiro_payload with reasoning_effort='max'
+        Purpose: Ensure max reasoning level works end-to-end in OpenAI conversion
+        """
+        request = ChatCompletionRequest(
+            model="claude-opus-4.7",
+            messages=[ChatMessage(role="user", content="Complex task")],
+            max_tokens=10000,
+            reasoning_effort="max"
+        )
+        with patch("kiro.converters_openai.get_model_id_for_kiro", return_value="claude-opus-4.7"):
+            payload = build_kiro_payload(
+                request_data=request,
+                conversation_id="test-conv-max",
+                profile_arn="arn:aws:test"
+            )
+        assert "additionalModelRequestFields" in payload
+        assert payload["additionalModelRequestFields"] == {"output_config": {"effort": "max"}}
+        user_input = payload["conversationState"]["currentMessage"]["userInputMessage"]
+        assert "<thinking_mode>" not in user_input["content"]
+
+    def test_build_kiro_payload_fallback_fake_reasoning(self, monkeypatch):
+        """
+        What it does: Verifies fallback to fake reasoning tag injection when native reasoning is disabled.
+        Purpose: Ensure backward compatibility when NATIVE_REASONING_ENABLED=False.
+        """
+        monkeypatch.setattr("kiro.converters_core.NATIVE_REASONING_ENABLED", False)
         monkeypatch.setattr("kiro.converters_core.FAKE_REASONING_ENABLED", True)
         monkeypatch.setattr("kiro.converters_core.FAKE_REASONING_BUDGET_CAP", 10000)
-        
-        print("Creating request with reasoning_effort='medium', max_tokens=8000...")
+
         request = ChatCompletionRequest(
             model="claude-sonnet-4.5",
             messages=[ChatMessage(role="user", content="Test message")],
             max_tokens=8000,
             reasoning_effort="medium"
         )
-        
-        print("Calling build_kiro_payload...")
-        payload = build_kiro_payload(
-            request_data=request,
-            conversation_id="test-conv-123",
-            profile_arn="arn:aws:test"
-        )
-        
-        print("Extracting userInputMessage content...")
+        with patch("kiro.converters_openai.get_model_id_for_kiro", return_value="claude-sonnet-4.5"):
+            payload = build_kiro_payload(
+                request_data=request,
+                conversation_id="test-conv-fallback",
+                profile_arn="arn:aws:test"
+            )
+
         user_input = payload["conversationState"]["currentMessage"]["userInputMessage"]
         content = user_input["content"]
-        
         expected_budget = int(8000 * 0.50)  # medium = 50%
-        print(f"Checking for <max_thinking_length>{expected_budget}</max_thinking_length>...")
         assert f"<max_thinking_length>{expected_budget}</max_thinking_length>" in content
         assert "<thinking_mode>enabled</thinking_mode>" in content
+        assert "additionalModelRequestFields" not in payload
+
+class TestNativeReasoningSchemaFromResolvedModel:
+    """
+    Tests that the native reasoning schema key follows the resolved Kiro model,
+    not the model name the client happened to send.
+    """
+
+    def _payload(self, model, effort="high"):
+        from kiro.converters_openai import build_kiro_payload
+        request = ChatCompletionRequest(
+            model=model,
+            messages=[ChatMessage(role="user", content="Test")],
+            reasoning_effort=effort,
+            max_tokens=4096,
+        )
+        return build_kiro_payload(request, "conv-schema-test", "arn:aws:test")
+
+    def test_auto_model_uses_output_config_schema(self):
+        """
+        What it does: The auto router is Claude-backed, so it takes output_config.
+        Goal: auto is the default alias, and reasoning.effort is wrong for Claude.
+        """
+        payload = self._payload("auto")
+        fields = payload.get("additionalModelRequestFields")
+        print(f"additionalModelRequestFields: {fields}")
+        assert fields == {"output_config": {"effort": "high"}}, f"got {fields}"
+
+    def test_claude_model_uses_output_config_schema(self):
+        """
+        What it does: An explicit Claude model takes output_config.
+        Goal: Baseline for the resolved-model rule.
+        """
+        payload = self._payload("claude-opus-4.7")
+        fields = payload.get("additionalModelRequestFields")
+        print(f"additionalModelRequestFields: {fields}")
+        assert fields == {"output_config": {"effort": "high"}}, f"got {fields}"
+
+    def test_non_claude_model_uses_reasoning_schema(self):
+        """
+        What it does: A non-Claude Kiro model takes the reasoning schema.
+        Goal: Kiro serves deepseek and qwen models that do not take output_config.
+
+        No non-Claude Kiro model currently accepts additionalModelRequestFields at
+        all, so the denylist is cleared here to keep the schema branch covered.
+        """
+        with patch("kiro.converters_core.NATIVE_REASONING_UNSUPPORTED_MODELS", []):
+            payload = self._payload("deepseek-3.2")
+        fields = payload.get("additionalModelRequestFields")
+        print(f"additionalModelRequestFields: {fields}")
+        assert fields == {"reasoning": {"effort": "high"}}, f"got {fields}"

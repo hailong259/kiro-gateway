@@ -339,8 +339,8 @@ class TestMessagesValidation:
     
     def test_validates_invalid_role(self, test_client, valid_proxy_api_key):
         """
-        What it does: Verifies invalid message role is rejected.
-        Purpose: Anthropic model strictly validates role (only 'user' or 'assistant').
+        What it does: Verifies invalid message role passes Pydantic validation.
+        Purpose: Pydantic model accepts any string as role to support non-standard roles like 'system' from Claude Code CLI.
         """
         print("Action: POST /v1/messages with invalid role...")
         response = test_client.post(
@@ -354,8 +354,8 @@ class TestMessagesValidation:
         )
         
         print(f"Status: {response.status_code}")
-        # Anthropic model strictly validates role - only 'user' or 'assistant' allowed
-        assert response.status_code == 422
+        # Pydantic model accepts any string as role, so validation passes (not 422)
+        assert response.status_code != 422
     
     def test_accepts_valid_request_format(self, test_client, valid_proxy_api_key):
         """
@@ -2519,3 +2519,66 @@ class TestCountTokensEndpoint:
         assert data["input_tokens"] > 0
         
         print("✅ max_tokens is NOT required for count_tokens")
+
+class TestThinkingDisplayReachesResponse:
+    """
+    Tests that thinking.display on the request changes the response body.
+
+    This covers the wiring between the request model and the response builders, which
+    the streaming unit tests cannot reach.
+    """
+
+    def _kiro_stream(self):
+        """Fake Kiro byte stream carrying reasoning frames then content."""
+        async def mock_aiter_bytes():
+            yield b'{"reasoningContent":{"reasoningText":{"text":"secret reasoning","signature":"SIG"}}}'
+            yield b'{"content":"the answer"}'
+            yield b'{"contextUsagePercentage":12.5}'
+        response = AsyncMock()
+        response.status_code = 200
+        response.aiter_bytes = mock_aiter_bytes
+        return response
+
+    def _post(self, test_client, api_key, thinking):
+        body = {
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        if thinking is not None:
+            body["thinking"] = thinking
+        with patch('kiro.http_client.KiroHttpClient.request_with_retry', return_value=self._kiro_stream()):
+            return test_client.post("/v1/messages", headers={"x-api-key": api_key}, json=body)
+
+    def test_omitted_display_removes_thinking_from_response(self, test_client, valid_proxy_api_key):
+        """
+        What it does: display=omitted yields a response with no thinking block.
+        Goal: The request field must reach the response builder, not just exist.
+        """
+        response = self._post(
+            test_client, valid_proxy_api_key,
+            {"type": "adaptive", "display": "omitted"}
+        )
+        print(f"Status: {response.status_code}")
+        assert response.status_code == 200
+
+        types = [b["type"] for b in response.json()["content"]]
+        print(f"content types: {types}")
+        assert "thinking" not in types, f"got {response.json()['content']}"
+
+    def test_absent_display_keeps_thinking_in_response(self, test_client, valid_proxy_api_key):
+        """
+        What it does: Without display, the thinking block is still returned.
+        Goal: The gateway default must be unchanged by the wiring.
+        """
+        response = self._post(test_client, valid_proxy_api_key, {"type": "adaptive"})
+        print(f"Status: {response.status_code}")
+        assert response.status_code == 200
+
+        blocks = response.json()["content"]
+        types = [b["type"] for b in blocks]
+        print(f"content types: {types}")
+        assert "thinking" in types, f"got {blocks}"
+        thinking_block = next(b for b in blocks if b["type"] == "thinking")
+        assert thinking_block["thinking"] == "secret reasoning"
+        assert thinking_block["signature"] == "SIG"

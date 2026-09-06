@@ -80,6 +80,8 @@ class KiroEvent:
     type: str
     content: Optional[str] = None
     thinking_content: Optional[str] = None
+    thinking_signature: Optional[str] = None
+    redacted_content: Optional[str] = None
     tool_use: Optional[Dict[str, Any]] = None
     usage: Optional[Dict[str, Any]] = None
     context_usage_percentage: Optional[float] = None
@@ -95,12 +97,16 @@ class StreamResult:
     Attributes:
         content: Full text content
         thinking_content: Full thinking/reasoning content
+        thinking_signature: Cryptographic signature for thinking block
+        redacted_thinking: Encrypted reasoning blocks the upstream would not return in clear
         tool_calls: List of tool calls
         usage: Usage information
         context_usage_percentage: Context usage percentage from Kiro API
     """
     content: str = ""
     thinking_content: str = ""
+    thinking_signature: Optional[str] = None
+    redacted_thinking: List[str] = field(default_factory=list)
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)
     usage: Optional[Dict[str, Any]] = None
     context_usage_percentage: Optional[float] = None
@@ -275,6 +281,15 @@ async def _process_chunk(
                 # No thinking parser - pass through as-is
                 yield KiroEvent(type="content", content=content)
         
+        elif event["type"] == "reasoning_text":
+            yield KiroEvent(type="thinking", thinking_content=event["data"])
+        
+        elif event["type"] == "reasoning_signature":
+            yield KiroEvent(type="thinking_signature", thinking_signature=event["data"])
+        
+        elif event["type"] == "reasoning_redacted":
+            yield KiroEvent(type="thinking_redacted", redacted_content=event["data"])
+        
         elif event["type"] == "usage":
             yield KiroEvent(type="usage", usage=event["data"])
         
@@ -315,6 +330,10 @@ async def collect_stream_to_result(
         elif event.type == "thinking" and event.thinking_content:
             result.thinking_content += event.thinking_content
             full_content_for_bracket_tools += event.thinking_content
+        elif event.type == "thinking_signature" and event.thinking_signature:
+            result.thinking_signature = event.thinking_signature
+        elif event.type == "thinking_redacted" and event.redacted_content:
+            result.redacted_thinking.append(event.redacted_content)
         elif event.type == "tool_use" and event.tool_use:
             result.tool_calls.append(event.tool_use)
         elif event.type == "usage" and event.usage:

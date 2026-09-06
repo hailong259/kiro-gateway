@@ -44,7 +44,7 @@ from kiro.models_anthropic import (
 )
 from kiro.auth import KiroAuthManager, AuthType
 from kiro.cache import ModelInfoCache
-from kiro.converters_anthropic import anthropic_to_kiro
+from kiro.converters_anthropic import anthropic_to_kiro, extract_thinking_display
 from kiro.streaming_anthropic import (
     stream_kiro_to_anthropic,
     collect_anthropic_response,
@@ -418,6 +418,7 @@ async def messages(
             
             # Prepare data for token counting
             messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
+            thinking_display = extract_thinking_display(request_data)
             tools_for_tokenizer = [tool.model_dump() for tool in request_data.tools] if request_data.tools else None
             if isinstance(request_data.system, list):
                 system_for_tokenizer = [b.model_dump() if hasattr(b, "model_dump") else b for b in request_data.system]
@@ -457,6 +458,7 @@ async def messages(
                                     request_messages=messages_for_tokenizer,
                                     request_tools=tools_for_tokenizer,
                                     request_system=system_for_tokenizer,
+                                    thinking_display=thinking_display,
                                 ):
                                     yield chunk
                             except GeneratorExit:
@@ -505,6 +507,7 @@ async def messages(
                             request_messages=messages_for_tokenizer,
                             request_tools=tools_for_tokenizer,
                             request_system=system_for_tokenizer,
+                            thinking_display=thinking_display,
                         )
                         
                         await http_client.close()
@@ -732,6 +735,7 @@ async def messages(
     # Prepare data for token counting
     # Convert Pydantic models to dicts for tokenizer
     messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
+    thinking_display = extract_thinking_display(request_data)
     tools_for_tokenizer = [tool.model_dump() for tool in request_data.tools] if request_data.tools else None
     # Serialize system prompt (may be a list of Pydantic objects)
     if isinstance(request_data.system, list):
@@ -815,6 +819,7 @@ async def messages(
                         request_messages=messages_for_tokenizer,
                         request_tools=tools_for_tokenizer,
                         request_system=system_for_tokenizer,
+                        thinking_display=thinking_display,
                     ):
                         yield chunk
                 except GeneratorExit:
@@ -864,6 +869,7 @@ async def messages(
                 request_messages=messages_for_tokenizer,
                 request_tools=tools_for_tokenizer,
                 request_system=system_for_tokenizer,
+                thinking_display=thinking_display,
             )
             
             await http_client.close()

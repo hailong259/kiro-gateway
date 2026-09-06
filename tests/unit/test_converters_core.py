@@ -36,6 +36,11 @@ from kiro.converters_core import (
     convert_tool_results_to_kiro_format,
     tool_calls_to_text,
     tool_results_to_text,
+    normalize_native_effort,
+    native_reasoning_schema_path,
+    native_reasoning_supported,
+    reasoning_effort_to_budget,
+    budget_to_effort,
     UnifiedMessage,
     UnifiedTool,
     ThinkingConfig,
@@ -6455,3 +6460,487 @@ class TestBuildKiroPayloadWithThinkingConfig:
         print(f"Checking for <max_thinking_length>7000</max_thinking_length> in content...")
         assert "<max_thinking_length>7000</max_thinking_length>" in content
         assert "<thinking_mode>enabled</thinking_mode>" in content
+
+
+class TestNormalizeNativeEffort:
+    """Tests for normalize_native_effort function."""
+
+    def test_valid_efforts(self):
+        """Verify low, medium, high, max are properly normalized."""
+        assert normalize_native_effort("low") == "low"
+        assert normalize_native_effort("medium") == "medium"
+        assert normalize_native_effort("high") == "high"
+        assert normalize_native_effort("max") == "max"
+        # Aliases
+        assert normalize_native_effort("minimal") == "low"
+        assert normalize_native_effort("xhigh") == "max"
+        # Case insensitive
+        assert normalize_native_effort("LOW") == "low"
+        assert normalize_native_effort("Medium") == "medium"
+        assert normalize_native_effort("HIGH") == "high"
+        assert normalize_native_effort("MAX") == "max"
+
+    def test_disabled_efforts_return_none(self):
+        """Verify disabled effort strings return None."""
+        assert normalize_native_effort("none") is None
+        assert normalize_native_effort("off") is None
+        assert normalize_native_effort("false") is None
+        assert normalize_native_effort("disabled") is None
+        assert normalize_native_effort("0") is None
+        assert normalize_native_effort("") is None
+
+    def test_none_returns_none(self):
+        """Verify None input returns None."""
+        assert normalize_native_effort(None) is None
+
+    def test_custom_effort_is_rejected(self):
+        """
+        Verify unknown effort strings are rejected rather than forwarded.
+
+        Kiro rejects unrecognized effort values, and the raw string used to reach it
+        verbatim inside additionalModelRequestFields.
+        """
+        assert normalize_native_effort("custom_tier") is None
+
+
+class TestBudgetToEffort:
+    """Tests for budget_to_effort function."""
+
+    def test_low_boundary(self):
+        """Verify budgets <= 2048 map to low."""
+        assert budget_to_effort(1000) == "low"
+        assert budget_to_effort(2048) == "low"
+
+    def test_medium_boundary(self):
+        """Verify budgets between 2049 and 8192 map to medium."""
+        assert budget_to_effort(2049) == "medium"
+        assert budget_to_effort(8192) == "medium"
+
+    def test_high_boundary(self):
+        """Verify budgets between 8193 and 24576 map to high."""
+        assert budget_to_effort(8193) == "high"
+        assert budget_to_effort(24576) == "high"
+
+    def test_max_boundary(self):
+        """Verify budgets > 24576 map to max."""
+        assert budget_to_effort(24577) == "max"
+        assert budget_to_effort(64000) == "max"
+
+    def test_zero_or_negative(self):
+        """Verify zero or negative budget defaults to low."""
+        assert budget_to_effort(0) == "low"
+        assert budget_to_effort(-10) == "low"
+
+
+class TestBuildKiroPayloadNativeReasoning:
+    """Tests for build_kiro_payload with native reasoning."""
+
+    def test_claude_model_uses_output_config(self):
+        """Verify Claude model uses output_config.effort schema."""
+        messages = [UnifiedMessage(role="user", content="Test message")]
+        thinking_config = ThinkingConfig(enabled=True, native_effort="high", schema_path="output_config")
+
+        result = build_kiro_payload(
+            messages=messages,
+            system_prompt="",
+            model_id="claude-opus-4.7",
+            tools=None,
+            conversation_id="conv-native-claude",
+            profile_arn="arn:aws:test",
+            thinking_config=thinking_config
+        )
+
+        assert "additionalModelRequestFields" in result.payload
+        assert result.payload["additionalModelRequestFields"] == {"output_config": {"effort": "high"}}
+        user_input = result.payload["conversationState"]["currentMessage"]["userInputMessage"]
+        assert "<thinking_mode>" not in user_input["content"]
+        assert "<max_thinking_length>" not in user_input["content"]
+
+    def test_non_claude_model_uses_reasoning_schema(self):
+        """
+        Verify non-Claude model uses reasoning.effort schema.
+
+        No Kiro model outside the Claude 4.6 generation currently accepts
+        additionalModelRequestFields, so the denylist is cleared here to keep the
+        schema branch covered.
+        """
+        messages = [UnifiedMessage(role="user", content="Test message")]
+        thinking_config = ThinkingConfig(enabled=True, native_effort="max", schema_path="reasoning")
+
+        with patch("kiro.converters_core.NATIVE_REASONING_UNSUPPORTED_MODELS", []):
+            result = build_kiro_payload(
+                messages=messages,
+                system_prompt="",
+                model_id="deepseek-r1",
+                tools=None,
+                conversation_id="conv-native-non-claude",
+                profile_arn="arn:aws:test",
+                thinking_config=thinking_config
+            )
+
+        assert "additionalModelRequestFields" in result.payload
+        assert result.payload["additionalModelRequestFields"] == {"reasoning": {"effort": "max"}}
+
+
+class TestBuildKiroHistoryReasoningContent:
+    """Tests for build_kiro_history with reasoning content."""
+
+    def test_assistant_message_with_reasoning_content_and_signature(self):
+        """Verify assistant message serializes reasoningContent with text and signature."""
+        messages = [
+            UnifiedMessage(role="user", content="Calculate 2+2"),
+            UnifiedMessage(
+                role="assistant",
+                content="The answer is 4",
+                reasoning_content="Let me add two and two together.",
+                reasoning_signature="sig_test_123"
+            ),
+            UnifiedMessage(role="user", content="Now multiply by 3")
+        ]
+
+        history = build_kiro_history(messages, model_id="claude-sonnet-4.5")
+        assert len(history) == 3
+
+        assistant_msg = history[1]["assistantResponseMessage"]
+        assert assistant_msg["content"] == "The answer is 4"
+        assert "reasoningContent" in assistant_msg
+        assert assistant_msg["reasoningContent"] == {
+            "reasoningText": {
+                "text": "Let me add two and two together.",
+                "signature": "sig_test_123"
+            }
+        }
+
+    def test_assistant_message_with_reasoning_content_without_signature(self):
+        """Verify assistant message omits reasoningContent when signature is absent."""
+        messages = [
+            UnifiedMessage(role="user", content="Hi"),
+            UnifiedMessage(
+                role="assistant",
+                content="Hello",
+                reasoning_content="I should greet the user politely."
+            ),
+            UnifiedMessage(role="user", content="How are you?")
+        ]
+
+        history = build_kiro_history(messages, model_id="claude-sonnet-4.5")
+        assistant_msg = history[1]["assistantResponseMessage"]
+        # Without valid signature, reasoningContent is omitted to avoid Kiro API validation error
+        assert "reasoningContent" not in assistant_msg
+
+    def test_assistant_message_without_reasoning_content(self):
+        """Verify assistant message has no reasoningContent when not provided."""
+        messages = [
+            UnifiedMessage(role="user", content="Hi"),
+            UnifiedMessage(role="assistant", content="Hello"),
+            UnifiedMessage(role="user", content="How are you?")
+        ]
+
+        history = build_kiro_history(messages, model_id="claude-sonnet-4.5")
+        assistant_msg = history[1]["assistantResponseMessage"]
+        assert "reasoningContent" not in assistant_msg
+
+
+class TestNormalizeNativeEffortRejectsUnknownValues:
+    """
+    Tests that an unrecognized effort never becomes a native effort value.
+
+    The docstring promises None for invalid input, but the function used to return
+    the raw string, which then reached the Kiro API verbatim.
+    """
+
+    def test_unknown_effort_returns_none(self):
+        """
+        What it does: An effort Kiro does not accept normalizes to None.
+        Goal: Forwarding it produces an upstream validation error the client cannot fix.
+        """
+        assert normalize_native_effort("ultra") is None
+        assert normalize_native_effort("turbo") is None
+        assert normalize_native_effort("HIGHEST") is None
+
+    def test_known_efforts_still_normalize(self):
+        """
+        What it does: The supported levels keep their mapping.
+        Goal: Guard against over-tightening the validation.
+        """
+        assert normalize_native_effort("low") == "low"
+        assert normalize_native_effort("minimal") == "low"
+        assert normalize_native_effort("medium") == "medium"
+        assert normalize_native_effort("high") == "high"
+        assert normalize_native_effort("max") == "max"
+        assert normalize_native_effort("xhigh") == "max"
+        assert normalize_native_effort("MEDIUM") == "medium"
+
+    def test_unknown_effort_budget_falls_back_without_raising(self):
+        """
+        What it does: An unknown effort still yields a usable budget.
+        Goal: Budget calculation must not raise or return zero for unknown input.
+        """
+        budget = reasoning_effort_to_budget(10000, "ultra")
+        print(f"budget for unknown effort: {budget}")
+        assert budget > 0
+
+
+class TestNativeReasoningSchemaPathResolution:
+    """Tests for native_reasoning_schema_path()."""
+
+    def test_claude_models_use_output_config(self):
+        """Verify Claude ids map to the Claude schema."""
+        assert native_reasoning_schema_path("claude-sonnet-4.5") == "output_config"
+        assert native_reasoning_schema_path("claude-opus-4.7") == "output_config"
+
+    def test_auto_router_uses_output_config(self):
+        """Verify the auto router maps to the Claude schema."""
+        assert native_reasoning_schema_path("auto") == "output_config"
+        assert native_reasoning_schema_path("auto-kiro") == "output_config"
+
+    def test_other_models_use_reasoning(self):
+        """Verify non-Claude Kiro models map to the reasoning schema."""
+        assert native_reasoning_schema_path("deepseek-3.2") == "reasoning"
+        assert native_reasoning_schema_path("qwen3-coder-next") == "reasoning"
+        assert native_reasoning_schema_path("") == "reasoning"
+
+
+class TestReasoningFieldsSurviveMessageTransforms:
+    """
+    Tests that reasoning_content and reasoning_signature survive the transforms that
+    rebuild messages. A dropped pair silently loses the thinking round-trip.
+    """
+
+    def test_strip_all_tool_content_keeps_reasoning_pair(self):
+        """
+        What it does: Stripping tool content keeps the thinking text and its signature.
+        Goal: Requests that define no tools would otherwise lose every thinking block.
+        """
+        messages = [
+            UnifiedMessage(
+                role="assistant",
+                content="answer",
+                tool_calls=[{"id": "t1", "function": {"name": "read", "arguments": "{}"}}],
+                reasoning_content="my thoughts",
+                reasoning_signature="SIG",
+            )
+        ]
+        result, had_tools = strip_all_tool_content(messages)
+
+        print(f"reasoning after strip: {result[0].reasoning_content!r}, {result[0].reasoning_signature!r}")
+        assert had_tools is True
+        assert result[0].reasoning_content == "my thoughts"
+        assert result[0].reasoning_signature == "SIG"
+
+    def test_ensure_assistant_before_tool_results_keeps_reasoning_pair(self):
+        """
+        What it does: Converting orphaned tool_results keeps the thinking pair.
+        Goal: Same loss reached through a different rebuild path.
+        """
+        messages = [
+            UnifiedMessage(
+                role="user",
+                content="question",
+                tool_results=[{"toolUseId": "t1", "content": [{"text": "out"}], "status": "success"}],
+                reasoning_content="thoughts",
+                reasoning_signature="SIG",
+            )
+        ]
+        result, converted = ensure_assistant_before_tool_results(messages)
+
+        target = result[-1]
+        print(f"converted={converted}, reasoning={target.reasoning_content!r}/{target.reasoning_signature!r}")
+        assert target.reasoning_content == "thoughts"
+        assert target.reasoning_signature == "SIG"
+
+    def test_merge_adjacent_assistants_keeps_a_valid_reasoning_pair(self):
+        """
+        What it does: Merging two assistant turns keeps one intact text/signature pair.
+        Goal: A signature belongs to its own text, so the pair must not be dropped.
+        """
+        messages = [
+            UnifiedMessage(role="assistant", content="a1", reasoning_content="R1", reasoning_signature="S1"),
+            UnifiedMessage(role="assistant", content="a2", reasoning_content="R2", reasoning_signature="S2"),
+        ]
+        merged = merge_adjacent_messages(messages)
+
+        print(f"merged: role={merged[0].role}, reasoning={merged[0].reasoning_content!r}/{merged[0].reasoning_signature!r}")
+        assert len(merged) == 1
+        assert merged[0].reasoning_content == "R1"
+        assert merged[0].reasoning_signature == "S1"
+
+    def test_merge_adjacent_assistants_adopts_reasoning_from_later_message(self):
+        """
+        What it does: When the first turn has no thinking, the later pair is adopted.
+        Goal: Keeping the pair is better than discarding thinking entirely.
+        """
+        messages = [
+            UnifiedMessage(role="assistant", content="a1"),
+            UnifiedMessage(role="assistant", content="a2", reasoning_content="R2", reasoning_signature="S2"),
+        ]
+        merged = merge_adjacent_messages(messages)
+
+        print(f"merged reasoning: {merged[0].reasoning_content!r}/{merged[0].reasoning_signature!r}")
+        assert len(merged) == 1
+        assert merged[0].reasoning_content == "R2"
+        assert merged[0].reasoning_signature == "S2"
+
+
+class TestRoleCaseNormalization:
+    """
+    Tests that role casing is normalized before unknown roles are demoted to user.
+
+    The request model accepts any role string, so a client typo like a capitalized
+    role used to be treated as unknown and silently turned into a user turn,
+    reordering the conversation instead of surfacing an error.
+    """
+
+    def test_capitalized_assistant_stays_assistant(self):
+        """
+        What it does: A capitalized assistant role normalizes to assistant.
+        Goal: Demoting it to user reorders the transcript and corrupts the history.
+        """
+        messages = [
+            UnifiedMessage(role="user", content="q"),
+            UnifiedMessage(role="Assistant", content="a"),
+        ]
+        result = normalize_message_roles(messages)
+
+        print(f"roles: {[m.role for m in result]}")
+        assert [m.role for m in result] == ["user", "assistant"]
+
+    def test_uppercase_user_stays_user(self):
+        """
+        What it does: An uppercase user role normalizes to user.
+        Goal: Same class of client typo on the other role.
+        """
+        result = normalize_message_roles([UnifiedMessage(role="USER", content="q")])
+
+        print(f"roles: {[m.role for m in result]}")
+        assert result[0].role == "user"
+
+    def test_mixed_case_system_is_still_demoted_to_user(self):
+        """
+        What it does: A system role keeps being folded into a user turn.
+        Goal: Kiro history has no system role; case handling must not change that.
+        """
+        result = normalize_message_roles([UnifiedMessage(role="System", content="s")])
+
+        print(f"roles: {[m.role for m in result]}")
+        assert result[0].role == "user"
+
+    def test_genuinely_unknown_role_is_still_demoted(self):
+        """
+        What it does: An unknown role is still demoted to user.
+        Goal: Guard against the case fix turning into blanket acceptance.
+        """
+        result = normalize_message_roles([UnifiedMessage(role="developer", content="d")])
+
+        print(f"roles: {[m.role for m in result]}")
+        assert result[0].role == "user"
+
+    def test_demoted_message_keeps_its_reasoning_pair(self):
+        """
+        What it does: Demoting a role keeps reasoning_content and reasoning_signature.
+        Goal: This rebuild dropped the pair like the other message transforms did.
+        """
+        result = normalize_message_roles([
+            UnifiedMessage(
+                role="developer",
+                content="d",
+                reasoning_content="thoughts",
+                reasoning_signature="SIG",
+            )
+        ])
+
+        print(f"reasoning: {result[0].reasoning_content!r} / {result[0].reasoning_signature!r}")
+        assert result[0].reasoning_content == "thoughts"
+        assert result[0].reasoning_signature == "SIG"
+
+
+class TestNativeReasoningModelSupport:
+    """
+    Tests which models may receive additionalModelRequestFields.
+
+    This gateway is a pass-through: models are discovered at runtime and the static
+    FALLBACK_MODELS list is only a fallback. So the rule is a denylist of models
+    measured as rejecting the field, not an allowlist. An allowlist silently pushed
+    claude-opus-5 (what Claude Code actually uses, and which Kiro accepts) onto the
+    thinking-tag path, which produced responses with no visible text.
+    """
+
+    def test_models_measured_as_rejecting_are_excluded(self):
+        """
+        Verify the models that answered HTTP 400 do not get the field.
+
+        Measured live against Kiro: each of these returns
+        "additionalModelRequestFields is not supported for this model".
+        """
+        for model in ("claude-sonnet-4", "claude-sonnet-4.5", "claude-opus-4.5",
+                      "claude-haiku-4.5", "deepseek-3.2", "glm-5",
+                      "minimax-m2.1", "minimax-m2.5", "qwen3-coder-next"):
+            assert native_reasoning_supported(model) is False, model
+
+    def test_models_measured_as_accepting_are_allowed(self):
+        """Verify the models that answered 200 still get the field."""
+        for model in ("auto", "claude-sonnet-4.6", "claude-opus-4.6", "claude-opus-4.7"):
+            assert native_reasoning_supported(model) is True, model
+
+    def test_model_claude_code_actually_uses_is_allowed(self):
+        """
+        Verify claude-opus-5 gets the field.
+
+        Kiro accepts it: the previous build sent the field on every request for this
+        model and worked. Excluding it was the regression.
+        """
+        assert native_reasoning_supported("claude-opus-5") is True
+        assert native_reasoning_supported("claude-sonnet-5") is True
+
+    def test_unknown_model_is_allowed_through(self):
+        """
+        Verify an unknown model still gets the field.
+
+        Pass-through is the project rule: Kiro decides what is valid. Guessing that a
+        newly discovered model cannot handle the field is what broke claude-opus-5.
+        """
+        assert native_reasoning_supported("some-future-model") is True
+        assert native_reasoning_supported("claude-opus-6") is True
+
+    def test_empty_model_is_not_allowed(self):
+        """Verify an empty model id does not get the field."""
+        assert native_reasoning_supported("") is False
+
+    def test_unsupported_model_gets_thinking_tags_instead(self):
+        """
+        What it does: An unsupported model falls back to thinking tag injection.
+        Goal: Reasoning must still work, just through the older mechanism.
+        """
+        result = build_kiro_payload(
+            messages=[UnifiedMessage(role="user", content="Test message")],
+            system_prompt="",
+            model_id="claude-sonnet-4.5",
+            tools=None,
+            conversation_id="conv-unsupported",
+            profile_arn="arn:aws:test",
+            thinking_config=ThinkingConfig(enabled=True, native_effort="high"),
+        )
+
+        assert "additionalModelRequestFields" not in result.payload
+        user_input = result.payload["conversationState"]["currentMessage"]["userInputMessage"]
+        print(f"content starts: {user_input['content'][:60]!r}")
+        assert "<thinking_mode>" in user_input["content"]
+
+    def test_supported_model_still_gets_native_fields(self):
+        """
+        What it does: A supported model keeps native reasoning and no tags.
+        Goal: Guard against the gate disabling the feature everywhere.
+        """
+        result = build_kiro_payload(
+            messages=[UnifiedMessage(role="user", content="Test message")],
+            system_prompt="",
+            model_id="claude-opus-4.7",
+            tools=None,
+            conversation_id="conv-supported",
+            profile_arn="arn:aws:test",
+            thinking_config=ThinkingConfig(enabled=True, native_effort="high"),
+        )
+
+        assert result.payload["additionalModelRequestFields"] == {"output_config": {"effort": "high"}}
+        user_input = result.payload["conversationState"]["currentMessage"]["userInputMessage"]
+        assert "<thinking_mode>" not in user_input["content"]

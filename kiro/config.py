@@ -433,6 +433,43 @@ _FAKE_REASONING_RAW: str = os.getenv("FAKE_REASONING", "").lower()
 # Default is True - if env var is not set or empty, enable fake reasoning
 FAKE_REASONING_ENABLED: bool = _FAKE_REASONING_RAW not in ("false", "0", "no", "disabled", "off")
 
+# Enable native reasoning - sends additionalModelRequestFields (output_config.effort / reasoning.effort)
+# to Kiro API, matching kiro-cli's native Bedrock extended thinking mechanism.
+# Default: true (enabled)
+_NATIVE_REASONING_RAW: str = os.getenv("NATIVE_REASONING", "").lower()
+NATIVE_REASONING_ENABLED: bool = _NATIVE_REASONING_RAW not in ("false", "0", "no", "disabled", "off")
+
+# Models whose Kiro endpoint REJECTS additionalModelRequestFields.
+# Those answer HTTP 400 "additionalModelRequestFields is not supported for this model",
+# which fails the whole request, so the field must not be sent to them - they fall back
+# to thinking tag injection instead.
+#
+# This is a denylist, not an allowlist, because the gateway is a pass-through: models
+# are discovered at runtime and this list cannot be complete. An unknown model gets the
+# field and Kiro decides, which is the project rule. An allowlist instead silently
+# demoted claude-opus-5 - a model Kiro does accept - to the tag path.
+#
+# Measured live against the Kiro API. Matching is EXACT, not by prefix: "claude-sonnet-4"
+# is a prefix of "claude-sonnet-4.6", which does accept the field, so prefix matching
+# would wrongly deny it.
+# Override with a comma-separated list as Kiro support changes.
+_DEFAULT_NATIVE_REASONING_UNSUPPORTED = (
+    "claude-sonnet-4,claude-sonnet-4.5,claude-opus-4.5,claude-haiku-4.5,"
+    "deepseek-3.2,glm-5,minimax-m2.1,minimax-m2.5,qwen3-coder-next"
+)
+NATIVE_REASONING_UNSUPPORTED_MODELS: List[str] = [
+    entry.strip().lower()
+    for entry in os.getenv(
+        "NATIVE_REASONING_UNSUPPORTED_MODELS", _DEFAULT_NATIVE_REASONING_UNSUPPORTED
+    ).split(",")
+    if entry.strip()
+]
+
+# Default reasoning effort when client does not specify one (None = don't force effort)
+# Supported values: "low", "medium", "high", "max" (or None)
+_raw_default_effort = os.getenv("DEFAULT_REASONING_EFFORT", "").strip().lower()
+DEFAULT_REASONING_EFFORT: Optional[str] = _raw_default_effort if _raw_default_effort in ("low", "medium", "high", "max") else None
+
 # Maximum thinking length in tokens (default budget when client doesn't specify).
 # This value is injected into the request as <max_thinking_length>{value}</max_thinking_length>
 # Higher values allow for more detailed reasoning but increase response time and token usage.

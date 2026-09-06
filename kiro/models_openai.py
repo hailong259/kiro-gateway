@@ -165,8 +165,8 @@ class ChatCompletionRequest(BaseModel):
     frequency_penalty: Optional[float] = None
     
     # Reasoning (OpenAI reasoning models)
-    # Supports all official reasoning_effort levels from OpenAI API
-    reasoning_effort: Optional[Literal["none", "minimal", "low", "medium", "high", "xhigh"]] = None
+    # Supports official reasoning_effort levels and kiro/anthropic aliases
+    reasoning_effort: Optional[Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]] = None
     
     # Tools (function calling)
     tools: Optional[List[Tool]] = None

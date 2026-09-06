@@ -41,6 +41,8 @@ from kiro.config import (
     FAKE_REASONING_ENABLED,
     FAKE_REASONING_MAX_TOKENS,
     FAKE_REASONING_BUDGET_CAP,
+    NATIVE_REASONING_ENABLED,
+    NATIVE_REASONING_UNSUPPORTED_MODELS,
     KIRO_MAX_PAYLOAD_BYTES,
     AUTO_TRIM_PAYLOAD,
 )
@@ -54,30 +56,196 @@ from kiro.payload_guards import check_payload_size, trim_payload_to_limit
 @dataclass
 class ThinkingConfig:
     """
-    Unified thinking configuration for fake reasoning.
+    Unified thinking configuration for reasoning.
     
     This configuration is created by API-specific adapters (OpenAI, Anthropic)
-    and passed to the core layer for thinking tag injection.
+    and passed to the core layer for native reasoning or fake reasoning tag injection.
     
     Attributes:
-        enabled: Whether to inject thinking tags into the request
-        budget_tokens: Token budget for thinking (None = use FAKE_REASONING_MAX_TOKENS default)
+        enabled: Whether thinking/reasoning is enabled
+        budget_tokens: Token budget for thinking (None = use default)
+        native_effort: Effort level for native reasoning ("low", "medium", "high", "max")
+        schema_path: Schema path for native reasoning ("output_config" for Claude, "reasoning" for others)
     
     Examples:
-        >>> # Default configuration (enabled with default budget)
+        >>> # Default configuration
         >>> ThinkingConfig()
-        ThinkingConfig(enabled=True, budget_tokens=None)
+        ThinkingConfig(enabled=True, budget_tokens=None, native_effort=None, schema_path='output_config')
         
-        >>> # Disabled by client (reasoning_effort="none" or thinking.type="disabled")
-        >>> ThinkingConfig(enabled=False, budget_tokens=None)
-        ThinkingConfig(enabled=False, budget_tokens=None)
-        
-        >>> # Custom budget from client
-        >>> ThinkingConfig(enabled=True, budget_tokens=8000)
-        ThinkingConfig(enabled=True, budget_tokens=8000)
+        >>> # Native reasoning with effort
+        >>> ThinkingConfig(enabled=True, native_effort="max", schema_path="output_config")
+        ThinkingConfig(enabled=True, budget_tokens=None, native_effort='max', schema_path='output_config')
     """
     enabled: bool = True
     budget_tokens: Optional[int] = None
+    native_effort: Optional[str] = None
+    schema_path: Optional[str] = None
+
+
+def native_reasoning_supported(model_id: str) -> bool:
+    """
+    Reports whether a Kiro model accepts additionalModelRequestFields.
+    
+    Some Kiro models answer HTTP 400 "additionalModelRequestFields is not supported for
+    this model", which fails the whole request rather than merely losing reasoning
+    depth. Those are listed in NATIVE_REASONING_UNSUPPORTED_MODELS and fall back to
+    thinking tag injection instead.
+    
+    An unrecognized model is allowed through, because the gateway is a pass-through:
+    models are discovered at runtime and the list cannot be complete, so Kiro decides.
+    Treating unknown models as unsupported instead demoted claude-opus-5 to the tag
+    path even though Kiro accepts the field for it.
+    
+    Args:
+        model_id: Resolved Kiro model id
+    
+    Returns:
+        True when the field may be sent
+    
+    Examples:
+        >>> native_reasoning_supported("claude-opus-5")
+        True
+        >>> native_reasoning_supported("claude-sonnet-4.5")
+        False
+    """
+    normalized = (model_id or "").strip().lower()
+    if not normalized:
+        return False
+    return normalized not in NATIVE_REASONING_UNSUPPORTED_MODELS
+
+
+def native_reasoning_schema_path(model_id: str) -> str:
+    """
+    Picks the additionalModelRequestFields schema key for a resolved Kiro model id.
+    
+    Claude models take output_config.effort; other Kiro models take reasoning.effort.
+    The auto router dispatches to Claude models, so it takes the Claude schema even
+    though its id does not name Claude.
+    
+    This must be given the resolved Kiro model id, never the model name the client
+    sent: aliases such as "auto" or a user-defined "gpt-5" mapping carry no hint of
+    the backing model.
+    
+    Args:
+        model_id: Resolved Kiro model id
+    
+    Returns:
+        Either "output_config" or "reasoning"
+    
+    Examples:
+        >>> native_reasoning_schema_path("claude-sonnet-4.5")
+        'output_config'
+        >>> native_reasoning_schema_path("auto")
+        'output_config'
+        >>> native_reasoning_schema_path("deepseek-3.2")
+        'reasoning'
+    """
+    normalized = (model_id or "").strip().lower()
+    if normalized.startswith("claude") or normalized.startswith("auto"):
+        return "output_config"
+    return "reasoning"
+
+
+def normalize_native_effort(effort: Any) -> Optional[str]:
+    """
+    Normalize effort level to one of Kiro API supported levels:
+    'low', 'medium', 'high', 'max' (or None if disabled/invalid).
+    
+    Args:
+        effort: Raw effort string or value
+        
+    Returns:
+        Normalized effort string or None
+    """
+    if not effort:
+        return None
+    val = str(effort).strip().lower()
+    if val in ("none", "off", "false", "disabled", "0"):
+        return None
+    if val in ("low", "minimal"):
+        return "low"
+    if val == "medium":
+        return "medium"
+    if val == "high":
+        return "high"
+    if val in ("max", "xhigh"):
+        # Kiro accepts four levels, so xhigh folds into max. Anthropic places xhigh
+        # between high and max, so this is the closest level Kiro can express.
+        return "max"
+    
+    # Unknown level: do not forward it. Kiro rejects unrecognized effort values with a
+    # validation error the client cannot act on, and the caller falls back to the
+    # thinking-tag path when no native effort is available.
+    logger.warning(f"Unsupported reasoning effort '{val}' ignored for native reasoning")
+    return None
+
+
+def budget_to_effort(budget_tokens: int) -> str:
+    """
+    Map token budget to closest native effort level.
+    
+    Args:
+        budget_tokens: Token budget for thinking
+        
+    Returns:
+        Effort level: "low", "medium", "high", or "max"
+    """
+    if budget_tokens <= 2048:
+        return "low"
+    elif budget_tokens <= 8192:
+        return "medium"
+    elif budget_tokens <= 24576:
+        return "high"
+    else:
+        return "max"
+
+
+# ==================================================================================================
+# Reasoning Effort Mapping
+# ==================================================================================================
+
+REASONING_EFFORT_PERCENTAGES: Dict[str, float] = {
+    "none": 0.0,      # 0% - thinking disabled
+    "minimal": 0.10,  # 10% - minimal reasoning
+    "low": 0.20,      # 20% - quick reasoning
+    "medium": 0.50,   # 50% - balanced reasoning
+    "high": 0.80,     # 80% - deep reasoning
+    "xhigh": 0.95,    # 95% - maximum reasoning depth
+    "max": 0.95,      # 95% - maximum reasoning depth (Anthropic / Claude Code / kiro-cli alias)
+}
+
+
+def reasoning_effort_to_budget(max_tokens: int, effort: str) -> int:
+    """
+    Convert reasoning_effort to thinking budget (production-grade mapping).
+    
+    Uses percentage-based approach that adapts to different max_tokens limits.
+    This ensures that thinking budget scales proportionally with the output limit.
+    
+    Args:
+        max_tokens: Maximum output tokens for the request
+        effort: Reasoning effort level ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+    
+    Returns:
+        Thinking budget in tokens
+    
+    Examples:
+        >>> reasoning_effort_to_budget(4096, "high")
+        3276  # 80% of 4096
+        >>> reasoning_effort_to_budget(10000, "medium")
+        5000  # 50% of 10000
+        >>> reasoning_effort_to_budget(64000, "max")
+        60800  # 95% of 64000
+    """
+    effort_normalized = str(effort).strip().lower()
+    percent = REASONING_EFFORT_PERCENTAGES.get(effort_normalized)
+    if percent is None:
+        percent = REASONING_EFFORT_PERCENTAGES["medium"]
+        logger.warning(
+            f"Unknown reasoning effort '{effort_normalized}', "
+            f"falling back to medium budget ({percent:.0%} of max_tokens)"
+        )
+    return int(max_tokens * percent)
 
 
 @dataclass
@@ -101,6 +269,8 @@ class UnifiedMessage:
     tool_calls: Optional[List[Dict[str, Any]]] = None
     tool_results: Optional[List[Dict[str, Any]]] = None
     images: Optional[List[Dict[str, Any]]] = None
+    reasoning_content: Optional[str] = None
+    reasoning_signature: Optional[str] = None
 
 
 @dataclass
@@ -974,7 +1144,9 @@ def strip_all_tool_content(messages: List[UnifiedMessage]) -> Tuple[List[Unified
                 content=content,
                 tool_calls=None,
                 tool_results=None,
-                images=msg.images
+                images=msg.images,
+                reasoning_content=msg.reasoning_content,
+                reasoning_signature=msg.reasoning_signature
             )
             result.append(cleaned_msg)
         else:
@@ -1057,7 +1229,9 @@ def ensure_assistant_before_tool_results(messages: List[UnifiedMessage]) -> Tupl
                     content=new_content,
                     tool_calls=msg.tool_calls,
                     tool_results=None,  # Remove orphaned tool_results (now in text)
-                    images=msg.images
+                    images=msg.images,
+                    reasoning_content=msg.reasoning_content,
+                    reasoning_signature=msg.reasoning_signature
                 )
                 result.append(cleaned_msg)
                 converted_any_tool_results = True
@@ -1108,6 +1282,14 @@ def merge_adjacent_messages(messages: List[UnifiedMessage]) -> List[UnifiedMessa
                 last_text = extract_text_content(last.content)
                 current_text = extract_text_content(msg.content)
                 last.content = f"{last_text}\n{current_text}"
+            
+            # Adopt reasoning from the later message only when the earlier one has none.
+            # A signature authenticates its own thinking text, so concatenating two
+            # blocks would produce a pair the upstream rejects. Keeping one intact pair
+            # is the only lossless option here.
+            if msg.reasoning_content and not last.reasoning_content:
+                last.reasoning_content = msg.reasoning_content
+                last.reasoning_signature = msg.reasoning_signature
             
             # Merge tool_calls for assistant messages
             if msg.role == "assistant" and msg.tool_calls:
@@ -1236,19 +1418,31 @@ def normalize_message_roles(messages: List[UnifiedMessage]) -> List[UnifiedMessa
     converted_count = 0
     
     for msg in messages:
-        if msg.role not in ("user", "assistant"):
-            logger.debug(f"Normalizing role '{msg.role}' to 'user'")
-            normalized_msg = UnifiedMessage(
-                role="user",
-                content=msg.content,
-                tool_calls=msg.tool_calls,
-                tool_results=msg.tool_results,
-                images=msg.images
-            )
-            normalized.append(normalized_msg)
-            converted_count += 1
-        else:
+        # Fix casing first. A client typo such as "Assistant" is a known role, and
+        # demoting it to user would reorder the transcript instead of preserving it.
+        canonical_role = (msg.role or "").strip().lower()
+        
+        if canonical_role in ("user", "assistant"):
+            if canonical_role != msg.role:
+                logger.debug(f"Normalizing role casing '{msg.role}' to '{canonical_role}'")
+                msg.role = canonical_role
             normalized.append(msg)
+            continue
+        
+        # Anything else (system, developer, ...) has no Kiro history equivalent and
+        # is folded into a user turn. Operator authority is not representable here.
+        logger.debug(f"Normalizing role '{msg.role}' to 'user'")
+        normalized_msg = UnifiedMessage(
+            role="user",
+            content=msg.content,
+            tool_calls=msg.tool_calls,
+            tool_results=msg.tool_results,
+            images=msg.images,
+            reasoning_content=msg.reasoning_content,
+            reasoning_signature=msg.reasoning_signature
+        )
+        normalized.append(normalized_msg)
+        converted_count += 1
     
     if converted_count > 0:
         logger.debug(f"Normalized {converted_count} message(s) with unknown roles to 'user'")
@@ -1393,6 +1587,15 @@ def build_kiro_history(messages: List[UnifiedMessage], model_id: str) -> List[Di
             if tool_uses:
                 assistant_response["toolUses"] = tool_uses
             
+            # Process reasoningContent if present (matches kiro-cli native format)
+            if msg.reasoning_content and msg.reasoning_signature:
+                assistant_response["reasoningContent"] = {
+                    "reasoningText": {
+                        "text": msg.reasoning_content,
+                        "signature": msg.reasoning_signature
+                    }
+                }
+            
             history.append({"assistantResponseMessage": assistant_response})
     
     return history
@@ -1443,10 +1646,28 @@ def build_kiro_payload(
     if tool_documentation:
         full_system_prompt = full_system_prompt + tool_documentation if full_system_prompt else tool_documentation.strip()
     
-    # Add thinking mode legitimization to system prompt if enabled
-    thinking_system_addition = get_thinking_system_prompt_addition()
-    if thinking_system_addition:
-        full_system_prompt = full_system_prompt + thinking_system_addition if full_system_prompt else thinking_system_addition.strip()
+    # Check if native reasoning should be used
+    use_native_reasoning = (
+        NATIVE_REASONING_ENABLED and
+        thinking_config.enabled and
+        bool(thinking_config.native_effort) and
+        thinking_config.native_effort.lower() != "none" and
+        native_reasoning_supported(model_id)
+    )
+    
+    if (NATIVE_REASONING_ENABLED and thinking_config.enabled
+            and thinking_config.native_effort and not use_native_reasoning
+            and not native_reasoning_supported(model_id)):
+        logger.debug(
+            f"Model '{model_id}' does not accept additionalModelRequestFields; "
+            f"falling back to thinking tag injection"
+        )
+    
+    # Add thinking mode legitimization to system prompt if enabled (only for fake reasoning)
+    if not use_native_reasoning:
+        thinking_system_addition = get_thinking_system_prompt_addition()
+        if thinking_system_addition:
+            full_system_prompt = full_system_prompt + thinking_system_addition if full_system_prompt else thinking_system_addition.strip()
     
     # Add truncation recovery legitimization to system prompt if enabled
     truncation_system_addition = get_truncation_recovery_system_addition()
@@ -1546,8 +1767,8 @@ def build_kiro_payload(
         if tool_results:
             user_input_context["toolResults"] = tool_results
     
-    # Inject thinking tags if enabled (only for the current/last user message)
-    if current_message.role == "user":
+    # Inject thinking tags if enabled (only for fake reasoning when native reasoning is NOT used)
+    if current_message.role == "user" and not use_native_reasoning:
         current_content = inject_thinking_tags(current_content, thinking_config)
     
     # Build userInputMessage
@@ -1575,6 +1796,16 @@ def build_kiro_payload(
             }
         }
     }
+    
+    # Add native reasoning fields if enabled (matches kiro-cli structure)
+    if use_native_reasoning:
+        schema_path = thinking_config.schema_path or native_reasoning_schema_path(model_id)
+        payload["additionalModelRequestFields"] = {
+            schema_path: {
+                "effort": thinking_config.native_effort
+            }
+        }
+        logger.debug(f"Applied native reasoning fields: {payload['additionalModelRequestFields']}")
     
     # Add history only if not empty
     if history:

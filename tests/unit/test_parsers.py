@@ -1357,3 +1357,141 @@ class TestTruncationRecoveryIntegration:
         
         print("Checking: Third tool call NOT marked as truncated...")
         assert aws_event_parser.tool_calls[2].get("_truncation_detected") is not True
+
+
+class TestAwsEventStreamParserReasoningContent:
+    """Tests for reasoningContentEvent parsing."""
+
+    def test_parses_reasoning_text_event(self, aws_event_parser):
+        """
+        What it does: Tests parsing of reasoning text chunk.
+        Goal: Ensure text chunk is converted to reasoning_text event.
+        """
+        chunk = b'{"text":"Thinking step 1"}'
+        events = aws_event_parser.feed(chunk)
+        assert len(events) == 1
+        assert events[0]["type"] == "reasoning_text"
+        assert events[0]["data"] == "Thinking step 1"
+
+    def test_parses_reasoning_signature_event(self, aws_event_parser):
+        """
+        What it does: Tests parsing of reasoning signature chunk.
+        Goal: Ensure signature chunk is converted to reasoning_signature event.
+        """
+        chunk = b'{"signature":"sig_abc123"}'
+        events = aws_event_parser.feed(chunk)
+        assert len(events) == 1
+        assert events[0]["type"] == "reasoning_signature"
+        assert events[0]["data"] == "sig_abc123"
+
+    def test_parses_reasoning_redacted_event(self, aws_event_parser):
+        """
+        What it does: Tests parsing of reasoning redactedContent.
+        Goal: Ensure redactedContent chunk produces reasoning_redacted event.
+        """
+        chunk = b'{"redactedContent":"redacted_binary_data"}'
+        events = aws_event_parser.feed(chunk)
+        assert len(events) == 1
+        assert events[0]["type"] == "reasoning_redacted"
+        assert events[0]["data"] == "redacted_binary_data"
+
+    def test_parses_interleaved_reasoning_and_content(self, aws_event_parser):
+        """
+        What it does: Tests sequential reasoning chunks followed by content chunks.
+        Goal: Verify full lifecycle of thinking followed by answer.
+        """
+        events1 = aws_event_parser.feed(b'{"text":"Let me calculate"}')
+        assert len(events1) == 1
+        assert events1[0] == {"type": "reasoning_text", "data": "Let me calculate"}
+
+        events2 = aws_event_parser.feed(b'{"text":" 2 + 2"}')
+        assert len(events2) == 1
+        assert events2[0] == {"type": "reasoning_text", "data": " 2 + 2"}
+
+        events3 = aws_event_parser.feed(b'{"signature":"sig_xyz789"}')
+        assert len(events3) == 1
+        assert events3[0] == {"type": "reasoning_signature", "data": "sig_xyz789"}
+
+        events4 = aws_event_parser.feed(b'{"content":"The answer is 4."}')
+        assert len(events4) == 1
+        assert events4[0] == {"type": "content", "data": "The answer is 4."}
+
+
+
+class TestReasoningEventPatternCollisions:
+    """
+    Tests that reasoning patterns do not hijack other frames.
+
+    The parser scans the raw buffer for JSON prefixes, so a bare pattern like
+    the text key can match a nested object inside an unrelated frame.
+    """
+
+    def test_tool_frame_with_nested_text_key_is_not_read_as_reasoning(self, aws_event_parser):
+        """
+        What it does: A tool frame whose input object holds a text key stays a tool frame.
+        Goal: Hijacking it destroys the tool call and leaks its argument as thinking.
+        """
+        events = aws_event_parser.feed(b'{"toolUseId":"t1","input":{"text":"file body"}}')
+
+        types = [e["type"] for e in events]
+        print(f"Events: {types}")
+        assert "reasoning_text" not in types, (
+            f"tool frame was parsed as reasoning: {events}"
+        )
+
+    def test_content_frame_with_nested_text_key_is_not_read_as_reasoning(self, aws_event_parser):
+        """
+        What it does: A frame whose nested object holds a text key is not reasoning.
+        Goal: Same collision class as the tool frame, reached through another key.
+        """
+        events = aws_event_parser.feed(b'{"toolUseId":"t2","payload":{"text":"not thinking"}}')
+
+        types = [e["type"] for e in events]
+        print(f"Events: {types}")
+        assert "reasoning_text" not in types, f"nested text key hijacked the frame: {events}"
+
+    def test_nested_reasoning_content_yields_text_and_signature(self, aws_event_parser):
+        """
+        What it does: The nested reasoningContent shape yields both text and signature.
+        Goal: This is the shape the request side writes, so the response likely mirrors it.
+        """
+        events = aws_event_parser.feed(
+            b'{"reasoningContent":{"reasoningText":{"text":"hi","signature":"S"}}}'
+        )
+
+        by_type = {e["type"]: e["data"] for e in events}
+        print(f"Events: {events}")
+        assert by_type.get("reasoning_text") == "hi", f"text missing: {events}"
+        assert by_type.get("reasoning_signature") == "S", f"signature missing: {events}"
+
+    def test_flat_text_and_signature_in_one_object_yields_both(self, aws_event_parser):
+        """
+        What it does: A single object holding both keys produces two events.
+        Goal: One event per JSON object silently dropped the signature.
+        """
+        events = aws_event_parser.feed(b'{"text":"thinking","signature":"SIG"}')
+
+        by_type = {e["type"]: e["data"] for e in events}
+        print(f"Events: {events}")
+        assert by_type.get("reasoning_text") == "thinking", f"text missing: {events}"
+        assert by_type.get("reasoning_signature") == "SIG", f"signature missing: {events}"
+
+    def test_null_signature_produces_no_event(self, aws_event_parser):
+        """
+        What it does: A null signature yields no reasoning_signature event.
+        Goal: A null signature reaching the client violates the Anthropic schema.
+        """
+        events = aws_event_parser.feed(b'{"signature":null}')
+
+        print(f"Events: {events}")
+        assert events == [], f"null signature produced an event: {events}"
+
+    def test_empty_signature_produces_no_event(self, aws_event_parser):
+        """
+        What it does: An empty signature yields no reasoning_signature event.
+        Goal: An empty signature is not replayable and must not overwrite a real one.
+        """
+        events = aws_event_parser.feed(b'{"signature":""}')
+
+        print(f"Events: {events}")
+        assert events == [], f"empty signature produced an event: {events}"

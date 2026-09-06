@@ -1667,3 +1667,397 @@ class TestStreamingAnthropicTruncationDetection:
         # Should detect truncation and set max_tokens
         assert result["stop_reason"] == "max_tokens"
         print("✓ collect_anthropic_response detects truncation correctly")
+
+
+class TestStreamingAnthropicNativeReasoning:
+    """Tests for native reasoning stream and non-streaming response in Anthropic format."""
+
+    @pytest.mark.asyncio
+    async def test_stream_emits_native_signature_delta(self, mock_response, mock_model_cache, mock_auth_manager):
+        """Verify stream emits signature_delta with native signature from KiroEvent."""
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="thinking", thinking_content="Thinking deeply...")
+            yield KiroEvent(type="thinking_signature", thinking_signature="sig_native_test_456")
+            yield KiroEvent(type="content", content="Final answer.")
+
+        events = []
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                async for event in stream_kiro_to_anthropic(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                ):
+                    events.append(event)
+
+        # Look for signature_delta in content_block_delta
+        sig_deltas = []
+        for event in events:
+            for line in event.split("\n"):
+                if line.startswith("data: ") and "signature_delta" in line:
+                    sig_deltas.append(json.loads(line[6:]))
+        assert len(sig_deltas) == 1
+        assert sig_deltas[0]["delta"]["signature"] == "sig_native_test_456"
+
+    @pytest.mark.asyncio
+    async def test_collect_preserves_native_signature(self, mock_response, mock_model_cache, mock_auth_manager):
+        """Verify collect_anthropic_response preserves native thinking signature without generating fake one."""
+        mock_result = StreamResult(
+            content="Hello world",
+            thinking_content="Thinking process here",
+            thinking_signature="sig_native_collected_123",
+            tool_calls=[],
+            usage=None,
+            context_usage_percentage=10.0
+        )
+
+        with patch('kiro.streaming_anthropic.collect_stream_to_result', return_value=mock_result):
+            response = await collect_anthropic_response(
+                mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+            )
+
+        assert len(response["content"]) == 2
+        thinking_block = response["content"][0]
+        assert thinking_block["type"] == "thinking"
+        assert thinking_block["thinking"] == "Thinking process here"
+        assert thinking_block["signature"] == "sig_native_collected_123"
+
+
+
+# ==================================================================================================
+# Tests for content block index integrity with native reasoning
+# ==================================================================================================
+
+def _parse_sse_blocks(events):
+    """
+    Extracts content_block_* payloads from a list of raw SSE strings.
+
+    Returns:
+        List of parsed JSON dicts for content_block_start/delta/stop events only.
+    """
+    blocks = []
+    for raw in events:
+        for line in raw.split("\n"):
+            if not line.startswith("data: "):
+                continue
+            payload = json.loads(line[len("data: "):])
+            if payload.get("type", "").startswith("content_block_"):
+                blocks.append(payload)
+    return blocks
+
+
+class TestNativeReasoningBlockIndexIntegrity:
+    """
+    Tests that interleaved native reasoning and text keep content block indices valid.
+
+    Native reasoning makes Kiro emit thinking frames after text has already started,
+    which the fake-reasoning tag path never did.
+    """
+
+    @pytest.fixture
+    def interleaved_stream(self):
+        """Stream with thinking, signature, text, thinking, signature, text."""
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="thinking", thinking_content="think A")
+            yield KiroEvent(type="thinking_signature", thinking_signature="SIG1")
+            yield KiroEvent(type="content", content="answer 1")
+            yield KiroEvent(type="thinking", thinking_content="think B")
+            yield KiroEvent(type="thinking_signature", thinking_signature="SIG2")
+            yield KiroEvent(type="content", content="answer 2")
+        return mock_parse_kiro_stream
+
+    async def _collect(self, stream_fn, mock_response, mock_model_cache, mock_auth_manager):
+        events = []
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', stream_fn):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                async for event in stream_kiro_to_anthropic(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                ):
+                    events.append(event)
+        return _parse_sse_blocks(events)
+
+    @pytest.mark.asyncio
+    async def test_every_content_block_start_uses_a_unique_index(
+        self, interleaved_stream, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Each content_block_start must claim an index no other start used.
+        Goal: Anthropic SDKs assemble blocks by index, so a reused index merges two blocks.
+        """
+        print("Setup: Interleaved thinking/text stream...")
+        blocks = await self._collect(interleaved_stream, mock_response, mock_model_cache, mock_auth_manager)
+
+        starts = [b["index"] for b in blocks if b["type"] == "content_block_start"]
+        print(f"content_block_start indices: {starts}")
+
+        assert len(starts) == len(set(starts)), f"content_block_start reused an index: {starts}"
+        print("OK: All content_block_start indices unique")
+
+    @pytest.mark.asyncio
+    async def test_no_delta_is_sent_after_its_block_stopped(
+        self, interleaved_stream, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: A content_block_delta must not follow content_block_stop for that index.
+        Goal: Deltas after stop are a protocol violation and get dropped or rejected by clients.
+        """
+        print("Setup: Interleaved thinking/text stream...")
+        blocks = await self._collect(interleaved_stream, mock_response, mock_model_cache, mock_auth_manager)
+
+        stopped = set()
+        violations = []
+        for b in blocks:
+            idx = b["index"]
+            if b["type"] == "content_block_stop":
+                stopped.add(idx)
+            elif b["type"] == "content_block_delta" and idx in stopped:
+                violations.append(b)
+            elif b["type"] == "content_block_start":
+                stopped.discard(idx)
+
+        print(f"Deltas after stop: {len(violations)}")
+        assert violations == [], f"delta sent after content_block_stop: {violations}"
+        print("OK: No delta after stop")
+
+    @pytest.mark.asyncio
+    async def test_each_thinking_block_carries_its_own_signature(
+        self, interleaved_stream, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Both upstream signatures reach the client, each on its own block.
+        Goal: A thinking block replayed with the wrong signature is rejected upstream.
+        """
+        print("Setup: Interleaved stream carrying SIG1 and SIG2...")
+        blocks = await self._collect(interleaved_stream, mock_response, mock_model_cache, mock_auth_manager)
+
+        sigs = [
+            b["delta"]["signature"]
+            for b in blocks
+            if b["type"] == "content_block_delta" and b.get("delta", {}).get("type") == "signature_delta"
+        ]
+        print(f"signature_delta values: {sigs}")
+
+        assert "SIG1" in sigs, f"SIG1 missing from {sigs}"
+        assert "SIG2" in sigs, f"SIG2 missing from {sigs}"
+        print("OK: Both signatures delivered")
+
+    @pytest.mark.asyncio
+    async def test_thinking_block_start_does_not_leak_earlier_signature(
+        self, interleaved_stream, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: A new thinking block must not open with a previously seen signature.
+        Goal: thinking_signature is mutated in place, so a stale value corrupts the block.
+        """
+        print("Setup: Interleaved thinking/text stream...")
+        blocks = await self._collect(interleaved_stream, mock_response, mock_model_cache, mock_auth_manager)
+
+        start_sigs = [
+            b["content_block"].get("signature")
+            for b in blocks
+            if b["type"] == "content_block_start" and b.get("content_block", {}).get("type") == "thinking"
+        ]
+        print(f"thinking content_block_start signatures: {start_sigs}")
+
+        assert "SIG1" not in start_sigs, f"thinking block opened with a stale signature: {start_sigs}"
+        print("OK: No stale signature on block start")
+
+    @pytest.mark.asyncio
+    async def test_null_upstream_signature_is_never_emitted(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: A null signature from upstream must not become signature_delta null.
+        Goal: The Anthropic schema types signature as a required string.
+        """
+        print("Setup: Stream where upstream sends a null signature...")
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="thinking", thinking_content="think A")
+            yield KiroEvent(type="thinking_signature", thinking_signature=None)
+            yield KiroEvent(type="content", content="answer")
+
+        blocks = await self._collect(mock_parse_kiro_stream, mock_response, mock_model_cache, mock_auth_manager)
+
+        emitted = [
+            b["delta"].get("signature")
+            for b in blocks
+            if b["type"] == "content_block_delta" and b.get("delta", {}).get("type") == "signature_delta"
+        ]
+        start_sigs = [
+            b["content_block"].get("signature")
+            for b in blocks
+            if b["type"] == "content_block_start" and b.get("content_block", {}).get("type") == "thinking"
+        ]
+        print(f"signature_delta values: {emitted}, block_start signatures: {start_sigs}")
+
+        assert None not in emitted, f"emitted a null signature_delta: {emitted}"
+        assert "" not in emitted, f"emitted an empty signature_delta: {emitted}"
+        assert None not in start_sigs, f"emitted a null signature on block start: {start_sigs}"
+        print("OK: No null or empty signature emitted")
+
+
+class TestRedactedThinkingIsDelivered:
+    """
+    Tests that redacted reasoning reaches the client as an Anthropic
+    redacted_thinking content block instead of being parsed and discarded.
+    """
+
+    @pytest.mark.asyncio
+    async def test_streaming_emits_redacted_thinking_block(
+        self, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: A redacted reasoning event becomes a redacted_thinking block.
+        Goal: The event was parsed and then dropped by every branch.
+        """
+        print("Setup: Stream carrying redacted reasoning...")
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="thinking_redacted", redacted_content="ENCRYPTED_BLOB")
+            yield KiroEvent(type="content", content="answer")
+
+        events = []
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                async for event in stream_kiro_to_anthropic(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                ):
+                    events.append(event)
+
+        blocks = _parse_sse_blocks(events)
+        redacted = [
+            b["content_block"]
+            for b in blocks
+            if b["type"] == "content_block_start"
+            and b.get("content_block", {}).get("type") == "redacted_thinking"
+        ]
+        print(f"redacted_thinking blocks: {redacted}")
+
+        assert len(redacted) == 1, f"expected one redacted_thinking block, got {blocks}"
+        assert redacted[0]["data"] == "ENCRYPTED_BLOB"
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_includes_redacted_thinking_block(self, mock_response):
+        """
+        What it does: The collected response carries a redacted_thinking block.
+        Goal: Non-streaming dropped redacted reasoning as well.
+        """
+        print("Setup: Collected result carrying redacted reasoning...")
+        result = StreamResult(
+            content="answer",
+            thinking_content="",
+            redacted_thinking=["ENCRYPTED_BLOB"],
+        )
+
+        with patch('kiro.streaming_anthropic.collect_stream_to_result', return_value=result):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                response = await collect_anthropic_response(
+                    mock_response, "claude-sonnet-4", MagicMock(), MagicMock()
+                )
+
+        types = [b["type"] for b in response["content"]]
+        print(f"content block types: {types}")
+        assert "redacted_thinking" in types, f"got {response['content']}"
+        block = next(b for b in response["content"] if b["type"] == "redacted_thinking")
+        assert block["data"] == "ENCRYPTED_BLOB"
+
+
+class TestThinkingDisplayOmitted:
+    """
+    Tests that an explicit thinking display of omitted suppresses thinking text.
+
+    Absent display keeps the gateway default, since this gateway exists to surface
+    reasoning that Kiro does not expose natively.
+    """
+
+    @pytest.fixture
+    def thinking_stream(self):
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="thinking", thinking_content="secret reasoning")
+            yield KiroEvent(type="thinking_signature", thinking_signature="SIG")
+            yield KiroEvent(type="content", content="answer")
+        return mock_parse_kiro_stream
+
+    async def _blocks(self, stream_fn, mock_response, mock_model_cache, mock_auth_manager, display):
+        events = []
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', stream_fn):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                async for event in stream_kiro_to_anthropic(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager,
+                    thinking_display=display
+                ):
+                    events.append(event)
+        return _parse_sse_blocks(events)
+
+    @pytest.mark.asyncio
+    async def test_omitted_display_emits_no_thinking_block(
+        self, thinking_stream, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: display=omitted produces no thinking content block.
+        Goal: The client asked not to receive reasoning text.
+        """
+        blocks = await self._blocks(
+            thinking_stream, mock_response, mock_model_cache, mock_auth_manager, "omitted"
+        )
+        types = [
+            b.get("content_block", {}).get("type")
+            for b in blocks if b["type"] == "content_block_start"
+        ]
+        print(f"block types: {types}")
+        assert "thinking" not in types, f"thinking block emitted despite omitted: {blocks}"
+
+    @pytest.mark.asyncio
+    async def test_omitted_display_does_not_leak_reasoning_as_text(
+        self, thinking_stream, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: The reasoning text does not reappear inside a text block.
+        Goal: Suppressing the block but inlining the text would defeat the request.
+        """
+        blocks = await self._blocks(
+            thinking_stream, mock_response, mock_model_cache, mock_auth_manager, "omitted"
+        )
+        texts = [
+            b["delta"].get("text", "")
+            for b in blocks
+            if b["type"] == "content_block_delta" and b.get("delta", {}).get("type") == "text_delta"
+        ]
+        print(f"text deltas: {texts}")
+        assert not any("secret reasoning" in t for t in texts), f"reasoning leaked: {texts}"
+
+    @pytest.mark.asyncio
+    async def test_absent_display_keeps_thinking_block(
+        self, thinking_stream, mock_response, mock_model_cache, mock_auth_manager
+    ):
+        """
+        What it does: Without display, the thinking block is still emitted.
+        Goal: The gateway default must not change.
+        """
+        blocks = await self._blocks(
+            thinking_stream, mock_response, mock_model_cache, mock_auth_manager, None
+        )
+        types = [
+            b.get("content_block", {}).get("type")
+            for b in blocks if b["type"] == "content_block_start"
+        ]
+        print(f"block types: {types}")
+        assert "thinking" in types, f"thinking block missing by default: {blocks}"
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_omitted_display_has_no_thinking_block(self, mock_response):
+        """
+        What it does: The collected response carries no thinking block when omitted.
+        Goal: Both response paths must honor the same request field.
+        """
+        result = StreamResult(content="answer", thinking_content="secret reasoning")
+
+        with patch('kiro.streaming_anthropic.collect_stream_to_result', return_value=result):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                response = await collect_anthropic_response(
+                    mock_response, "claude-sonnet-4", MagicMock(), MagicMock(),
+                    thinking_display="omitted"
+                )
+
+        types = [b["type"] for b in response["content"]]
+        print(f"content types: {types}")
+        assert "thinking" not in types, f"got {response['content']}"

@@ -240,6 +240,10 @@ class AwsEventStreamParser:
     # Patterns for finding JSON events
     EVENT_PATTERNS = [
         ('{"content":', 'content'),
+        ('{"reasoningContent":', 'reasoning_content'),
+        ('{"text":', 'reasoning_text'),
+        ('{"signature":', 'reasoning_signature'),
+        ('{"redactedContent":', 'reasoning_redacted'),
         ('{"name":', 'tool_start'),
         ('{"input":', 'tool_input'),
         ('{"stop":', 'tool_stop'),
@@ -278,7 +282,7 @@ class AwsEventStreamParser:
             earliest_type = None
             
             for pattern, event_type in self.EVENT_PATTERNS:
-                pos = self.buffer.find(pattern)
+                pos = self._find_top_level_pattern(pattern)
                 if pos != -1 and (earliest_pos == -1 or pos < earliest_pos):
                     earliest_pos = pos
                     earliest_type = event_type
@@ -299,11 +303,55 @@ class AwsEventStreamParser:
                 data = json.loads(json_str)
                 event = self._process_event(data, earliest_type)
                 if event:
-                    events.append(event)
+                    # Some frames carry more than one event (reasoning text plus signature)
+                    if isinstance(event, list):
+                        events.extend(event)
+                    else:
+                        events.append(event)
             except json.JSONDecodeError:
                 logger.warning(f"Failed to parse JSON: {json_str[:100]}")
         
         return events
+    
+    @staticmethod
+    def _is_nested_match(buffer: str, pos: int) -> bool:
+        """
+        Reports whether a pattern match is an object nested inside another object.
+        
+        A frame payload is never preceded by a colon, so a colon before the opening
+        brace means this object is the value of some other key and must not be read
+        as a frame of its own.
+        
+        Args:
+            buffer: Buffer being scanned
+            pos: Index of the opening brace of the match
+        
+        Returns:
+            True when the match is a nested value
+        """
+        i = pos - 1
+        while i >= 0 and buffer[i].isspace():
+            i -= 1
+        return i >= 0 and buffer[i] == ":"
+    
+    def _find_top_level_pattern(self, pattern: str) -> int:
+        """
+        Finds the first occurrence of pattern that is not nested in another object.
+        
+        Args:
+            pattern: JSON prefix to search for
+        
+        Returns:
+            Index of the match, or -1 when there is none
+        """
+        start = 0
+        while True:
+            pos = self.buffer.find(pattern, start)
+            if pos == -1:
+                return -1
+            if not self._is_nested_match(self.buffer, pos):
+                return pos
+            start = pos + 1
     
     def _process_event(self, data: dict, event_type: str) -> Optional[Dict[str, Any]]:
         """
@@ -318,6 +366,18 @@ class AwsEventStreamParser:
         """
         if event_type == 'content':
             return self._process_content_event(data)
+        elif event_type == 'reasoning_content':
+            return self._process_reasoning_content_event(data)
+        elif event_type == 'reasoning_text':
+            # A frame may carry the text and its signature together
+            return self._build_reasoning_events(data.get('text', ''), data.get('signature'))
+        elif event_type == 'reasoning_signature':
+            return self._build_reasoning_events(None, data.get('signature'))
+        elif event_type == 'reasoning_redacted':
+            redacted = data.get('redactedContent')
+            if not redacted:
+                return None
+            return {"type": "reasoning_redacted", "data": redacted}
         elif event_type == 'tool_start':
             return self._process_tool_start_event(data)
         elif event_type == 'tool_input':
@@ -330,6 +390,58 @@ class AwsEventStreamParser:
             return {"type": "context_usage", "data": data.get('contextUsagePercentage', 0)}
         
         return None
+    
+    @staticmethod
+    def _build_reasoning_events(text: Optional[str], signature: Optional[str]) -> Optional[List[Dict[str, Any]]]:
+        """
+        Builds reasoning events, dropping parts that carry nothing usable.
+        
+        An empty or null signature is skipped: it is not replayable, and emitting it
+        would overwrite a real signature downstream.
+        
+        Args:
+            text: Reasoning text, if the frame carried any
+            signature: Reasoning signature, if the frame carried one
+        
+        Returns:
+            List of events, or None when the frame carried nothing
+        """
+        events: List[Dict[str, Any]] = []
+        if text:
+            events.append({"type": "reasoning_text", "data": text})
+        if signature:
+            events.append({"type": "reasoning_signature", "data": signature})
+        return events or None
+    
+    def _process_reasoning_content_event(self, data: dict) -> Optional[List[Dict[str, Any]]]:
+        """
+        Processes the nested reasoningContent frame shape.
+        
+        Shape: {"reasoningContent": {"reasoningText": {"text": ..., "signature": ...}}}
+        The redacted variant carries redactedContent in place of reasoningText.
+        
+        Args:
+            data: Parsed frame JSON
+        
+        Returns:
+            List of reasoning events, or None when nothing usable is present
+        """
+        block = data.get('reasoningContent') or {}
+        if not isinstance(block, dict):
+            return None
+        
+        redacted = block.get('redactedContent')
+        if redacted:
+            return [{"type": "reasoning_redacted", "data": redacted}]
+        
+        reasoning_text = block.get('reasoningText') or {}
+        if not isinstance(reasoning_text, dict):
+            return None
+        
+        return self._build_reasoning_events(
+            reasoning_text.get('text'),
+            reasoning_text.get('signature')
+        )
     
     def _process_content_event(self, data: dict) -> Optional[Dict[str, Any]]:
         """Processes content event."""

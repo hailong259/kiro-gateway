@@ -126,6 +126,34 @@ def _extract_cache_usage_fields(usage: Optional[Dict[str, Any]]) -> Dict[str, in
     return extracted
 
 
+def resolve_thinking_handling(thinking_display: Optional[str]) -> str:
+    """
+    Resolves how thinking content should be surfaced for one request.
+    
+    Anthropic exposes thinking.display to control whether reasoning text is returned.
+    Only an explicit "omitted" is acted on: on the Anthropic API "omitted" is the
+    default for current models, but adopting that default would stop this gateway from
+    surfacing the reasoning it exists to expose, so an absent value keeps the
+    configured FAKE_REASONING_HANDLING behavior.
+    
+    Args:
+        thinking_display: Value of thinking.display from the request, if any
+    
+    Returns:
+        "strip" when the client asked for no reasoning text, otherwise the
+        configured FAKE_REASONING_HANDLING
+    
+    Examples:
+        >>> resolve_thinking_handling("omitted")
+        'strip'
+        >>> resolve_thinking_handling(None) == FAKE_REASONING_HANDLING
+        True
+    """
+    if thinking_display and str(thinking_display).strip().lower() == "omitted":
+        return "strip"
+    return FAKE_REASONING_HANDLING
+
+
 async def stream_kiro_to_anthropic(
     response: httpx.Response,
     model: str,
@@ -135,7 +163,8 @@ async def stream_kiro_to_anthropic(
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
     request_system: Optional[Any] = None,
-    conversation_id: Optional[str] = None
+    conversation_id: Optional[str] = None,
+    thinking_display: Optional[str] = None
 ) -> AsyncGenerator[str, None]:
     """
     Generator for converting Kiro stream to Anthropic SSE format.
@@ -182,6 +211,11 @@ async def stream_kiro_to_anthropic(
         )
         input_tokens = request_token_stats["total_tokens"]
     
+    # An explicit thinking display of "omitted" means the client does not want the
+    # reasoning text. Absent display keeps the configured gateway behavior, because
+    # surfacing reasoning Kiro hides is the point of this gateway.
+    thinking_handling = resolve_thinking_handling(thinking_display)
+    
     # Track content blocks - thinking block is index 0, text block is index 1 (when thinking enabled)
     current_block_index = 0
     thinking_block_started = False
@@ -191,8 +225,60 @@ async def stream_kiro_to_anthropic(
     tool_blocks: List[Dict[str, Any]] = []
     tool_input_buffers: Dict[int, str] = {}  # index -> accumulated JSON
     
-    # Generate signature for thinking block (used if thinking is present)
-    thinking_signature = generate_thinking_signature()
+    # Signature of the thinking block currently open. Anthropic delivers the real
+    # signature as a signature_delta, so content_block_start carries an empty one.
+    thinking_signature: Optional[str] = None
+    signature_delta_sent = False
+    
+    def close_thinking_block_events() -> List[str]:
+        """
+        Closes the open thinking block, emitting its signature_delta first.
+        
+        Resets every per-block variable so a following thinking block gets its own
+        index and its own signature instead of inheriting this one.
+        """
+        nonlocal thinking_block_started, thinking_block_index, signature_delta_sent
+        nonlocal thinking_signature, current_block_index
+        events_out = []
+        if thinking_block_started and thinking_block_index is not None:
+            if not signature_delta_sent and thinking_handling == "as_reasoning_content":
+                # A thinking block the client cannot replay is useless, so fall back
+                # to a generated signature when upstream sent none.
+                events_out.append(format_sse_event("content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": thinking_block_index,
+                    "delta": {
+                        "type": "signature_delta",
+                        "signature": thinking_signature or generate_thinking_signature()
+                    }
+                }))
+                signature_delta_sent = True
+            events_out.append(format_sse_event("content_block_stop", {
+                "type": "content_block_stop",
+                "index": thinking_block_index
+            }))
+            thinking_block_started = False
+            thinking_block_index = None
+            signature_delta_sent = False
+            thinking_signature = None
+            current_block_index += 1
+        return events_out
+    
+    def close_text_block_events() -> List[str]:
+        """
+        Closes the open text block so the next block starts on a free index.
+        """
+        nonlocal text_block_started, text_block_index, current_block_index
+        events_out = []
+        if text_block_started and text_block_index is not None:
+            events_out.append(format_sse_event("content_block_stop", {
+                "type": "content_block_stop",
+                "index": text_block_index
+            }))
+            text_block_started = False
+            text_block_index = None
+            current_block_index += 1
+        return events_out
     
     # Track context usage for token calculation
     context_usage_percentage: Optional[float] = None
@@ -226,13 +312,8 @@ async def stream_kiro_to_anthropic(
                 full_content += content
                 
                 # Close thinking block if it was open and we're now getting regular content
-                if thinking_block_started and thinking_block_index is not None:
-                    yield format_sse_event("content_block_stop", {
-                        "type": "content_block_stop",
-                        "index": thinking_block_index
-                    })
-                    thinking_block_started = False
-                    current_block_index += 1
+                for sse_msg in close_thinking_block_events():
+                    yield sse_msg
                 
                 # Start text block if not started
                 if not text_block_started:
@@ -263,9 +344,13 @@ async def stream_kiro_to_anthropic(
                 full_thinking_content += thinking_content
                 
                 # Handle thinking content based on mode
-                if FAKE_REASONING_HANDLING == "as_reasoning_content":
+                if thinking_handling == "as_reasoning_content":
                     # Use native Anthropic thinking content blocks
                     if not thinking_block_started:
+                        # Native reasoning frames can arrive after text has started.
+                        # Close the open text block so this one gets its own index.
+                        for sse_msg in close_text_block_events():
+                            yield sse_msg
                         thinking_block_index = current_block_index
                         yield format_sse_event("content_block_start", {
                             "type": "content_block_start",
@@ -273,7 +358,7 @@ async def stream_kiro_to_anthropic(
                             "content_block": {
                                 "type": "thinking",
                                 "thinking": "",
-                                "signature": thinking_signature
+                                "signature": ""
                             }
                         })
                         thinking_block_started = True
@@ -288,16 +373,10 @@ async def stream_kiro_to_anthropic(
                             }
                         })
                 
-                elif FAKE_REASONING_HANDLING == "include_as_text":
+                elif thinking_handling == "include_as_text":
                     # Include thinking as regular text content
-                    # Close thinking block if it was open (shouldn't happen in this mode)
-                    if thinking_block_started and thinking_block_index is not None:
-                        yield format_sse_event("content_block_stop", {
-                            "type": "content_block_stop",
-                            "index": thinking_block_index
-                        })
-                        thinking_block_started = False
-                        current_block_index += 1
+                    for sse_msg in close_thinking_block_events():
+                        yield sse_msg
                     
                     # Start text block if not started
                     if not text_block_started:
@@ -323,24 +402,54 @@ async def stream_kiro_to_anthropic(
                         })
                 # For "strip" mode, we just skip the thinking content
             
+            elif event.type == "thinking_redacted" and event.redacted_content:
+                # Redacted reasoning is opaque, so it ships as one complete block.
+                # Close any open block first so this one gets its own index.
+                for sse_msg in close_thinking_block_events():
+                    yield sse_msg
+                for sse_msg in close_text_block_events():
+                    yield sse_msg
+                
+                redacted_index = current_block_index
+                yield format_sse_event("content_block_start", {
+                    "type": "content_block_start",
+                    "index": redacted_index,
+                    "content_block": {
+                        "type": "redacted_thinking",
+                        "data": event.redacted_content
+                    }
+                })
+                yield format_sse_event("content_block_stop", {
+                    "type": "content_block_stop",
+                    "index": redacted_index
+                })
+                current_block_index += 1
+            
+            elif event.type == "thinking_signature":
+                # Drop empty and null signatures: the Anthropic schema types signature
+                # as a required string, and the block close supplies a fallback.
+                if event.thinking_signature:
+                    thinking_signature = event.thinking_signature
+                    if (thinking_handling == "as_reasoning_content"
+                            and thinking_block_started and not signature_delta_sent):
+                        yield format_sse_event("content_block_delta", {
+                            "type": "content_block_delta",
+                            "index": thinking_block_index,
+                            "delta": {
+                                "type": "signature_delta",
+                                "signature": thinking_signature
+                            }
+                        })
+                        signature_delta_sent = True
+            
             elif event.type == "tool_use" and event.tool_use:
                 # Close thinking block if open
-                if thinking_block_started and thinking_block_index is not None:
-                    yield format_sse_event("content_block_stop", {
-                        "type": "content_block_stop",
-                        "index": thinking_block_index
-                    })
-                    thinking_block_started = False
-                    current_block_index += 1
+                for sse_msg in close_thinking_block_events():
+                    yield sse_msg
                 
                 # Close text block if open
-                if text_block_started and text_block_index is not None:
-                    yield format_sse_event("content_block_stop", {
-                        "type": "content_block_stop",
-                        "index": text_block_index
-                    })
-                    text_block_started = False
-                    current_block_index += 1
+                for sse_msg in close_text_block_events():
+                    yield sse_msg
                 
                 tool = event.tool_use
                 tool_id = tool.get("id") or f"toolu_{uuid.uuid4().hex[:24]}"
@@ -530,22 +639,12 @@ async def stream_kiro_to_anthropic(
         bracket_tool_calls = parse_bracket_tool_calls(full_content)
         if bracket_tool_calls:
             # Close thinking block if open
-            if thinking_block_started and thinking_block_index is not None:
-                yield format_sse_event("content_block_stop", {
-                    "type": "content_block_stop",
-                    "index": thinking_block_index
-                })
-                thinking_block_started = False
-                current_block_index += 1
+            for sse_msg in close_thinking_block_events():
+                yield sse_msg
             
             # Close text block if open
-            if text_block_started and text_block_index is not None:
-                yield format_sse_event("content_block_stop", {
-                    "type": "content_block_stop",
-                    "index": text_block_index
-                })
-                text_block_started = False
-                current_block_index += 1
+            for sse_msg in close_text_block_events():
+                yield sse_msg
             
             for tc in bracket_tool_calls:
                 tool_id = tc.get("id") or f"toolu_{uuid.uuid4().hex[:24]}"
@@ -592,19 +691,12 @@ async def stream_kiro_to_anthropic(
                 current_block_index += 1
         
         # Close thinking block if still open
-        if thinking_block_started and thinking_block_index is not None:
-            yield format_sse_event("content_block_stop", {
-                "type": "content_block_stop",
-                "index": thinking_block_index
-            })
-            current_block_index += 1
+        for sse_msg in close_thinking_block_events():
+            yield sse_msg
         
         # Close text block if still open
-        if text_block_started and text_block_index is not None:
-            yield format_sse_event("content_block_stop", {
-                "type": "content_block_stop",
-                "index": text_block_index
-            })
+        for sse_msg in close_text_block_events():
+            yield sse_msg
         
         # Detect content truncation (missing completion signals)
         content_was_truncated = (
@@ -725,7 +817,8 @@ async def collect_anthropic_response(
     auth_manager: "KiroAuthManager",
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
-    request_system: Optional[Any] = None
+    request_system: Optional[Any] = None,
+    thinking_display: Optional[str] = None
 ) -> dict:
     """
     Collect full response from Kiro stream in Anthropic format.
@@ -740,6 +833,7 @@ async def collect_anthropic_response(
         request_messages: Original request messages (for token counting)
         request_tools: Original request tools (for token counting)
         request_system: Original system prompt (for token counting)
+        thinking_display: Value of thinking.display from the request, if any
     
     Returns:
         Dictionary with full response in Anthropic Messages format
@@ -764,18 +858,27 @@ async def collect_anthropic_response(
     # Build content blocks
     content_blocks = []
     
+    # Redacted reasoning comes first, mirroring the order upstream sends it
+    for redacted in result.redacted_thinking:
+        content_blocks.append({
+            "type": "redacted_thinking",
+            "data": redacted
+        })
+    
+    thinking_handling = resolve_thinking_handling(thinking_display)
+    
     # Add thinking block FIRST if there's thinking content and mode is as_reasoning_content
-    if result.thinking_content and FAKE_REASONING_HANDLING == "as_reasoning_content":
+    if result.thinking_content and thinking_handling == "as_reasoning_content":
         content_blocks.append({
             "type": "thinking",
             "thinking": result.thinking_content,
-            "signature": generate_thinking_signature()
+            "signature": result.thinking_signature or generate_thinking_signature()
         })
     
     # Add text block if there's content
     # For include_as_text mode, prepend thinking content to regular content
     text_content = result.content
-    if result.thinking_content and FAKE_REASONING_HANDLING == "include_as_text":
+    if result.thinking_content and thinking_handling == "include_as_text":
         text_content = result.thinking_content + text_content
     
     if text_content:
@@ -873,7 +976,8 @@ async def stream_with_first_token_retry_anthropic(
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
-    request_system: Optional[Any] = None
+    request_system: Optional[Any] = None,
+    thinking_display: Optional[str] = None
 ) -> AsyncGenerator[str, None]:
     """
     Streaming with automatic retry on first token timeout for Anthropic API.
@@ -896,6 +1000,7 @@ async def stream_with_first_token_retry_anthropic(
         request_messages: Original request messages (for fallback token counting)
         request_tools: Original request tools (for fallback token counting)
         request_system: Original system prompt (for fallback token counting)
+        thinking_display: Value of thinking.display from the request, if any
     
     Yields:
         Strings in Anthropic SSE format
@@ -934,6 +1039,7 @@ async def stream_with_first_token_retry_anthropic(
             request_messages=request_messages,
             request_tools=request_tools,
             request_system=request_system,
+            thinking_display=thinking_display,
         ):
             yield chunk
     
